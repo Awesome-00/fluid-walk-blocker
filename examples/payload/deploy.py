@@ -1396,12 +1396,13 @@ def _open_spool_dir(spool, uid):
 
 
 def repair_spool(spool, gid, uid=0, dry_run=False, out=None):
-    """The one-time read-scope sweep, before the spool is judged.
+    """The one-time read-scope sweep, after preflight has judged the spool
+    and the previous units are down (#74).
 
     Only what spool_mode_repairs() lists, and each entry is re-judged on the
     fd it is repaired through: an entry that changed between the listing and
-    the open is skipped rather than repaired, and the blockers that run next
-    see it as whatever it now is. Every entry is opened relative to the
+    the open is skipped rather than repaired, and create_spool(), which runs
+    later in system_execute(), judges it as whatever it now is. Every entry is opened relative to the
     spool's fd, O_NOFOLLOW and O_NONBLOCK -- a link is refused by the open,
     and a fifo planted under a trail's name cannot hang the install.
     """
@@ -1972,7 +1973,7 @@ def write_unknown_refusal(unknowns, out=None):
     return 6
 
 
-def preflight(args, privileged, repair=None, out=None):
+def preflight(args, privileged, out=None):
     """Every check `system_execute()` makes before its first `systemctl`, in
     the order it makes them -- run from ONE place, by both callers.
 
@@ -1993,13 +1994,13 @@ def preflight(args, privileged, repair=None, out=None):
     the preview REPORTS -- never as clean, and never as a blocker
     manufactured out of the reader's uid -- and which the install refuses.
 
-    `repair` is the install's one asymmetry, named here rather than
-    duplicated: it sets the read scope of the spool and its own files before
-    judging them, because that is the state this code exists to correct,
-    where the preview advertises the identical list from the identical
-    function. It runs after the paths are judged and before the audit
-    directory is, exactly where the install used to do it inline, and it is
-    handed the reader group's gid, resolved here.
+    Nothing here writes to the spool. The install's one asymmetry with the
+    preview is that it sets the read scope of the spool and its own files,
+    and it does that in `system_execute()`, after these checks and after the
+    previous units are down (#74); the preview advertises the identical list
+    from the identical function. The spool is judged here as the install
+    will leave it: `audit_dir_blockers()` does not refuse over a path
+    `spool_mode_repairs()` lists.
 
     The groups come first (ADR-0025): the reader group must resolve, and
     every listed service group must be proven free of people, before the
@@ -2114,10 +2115,10 @@ def preflight(args, privileged, repair=None, out=None):
     spool = canonical_prefix(args.spool_dir)
     prefix = canonical_prefix(args.prefix)
 
-    # 2. The audit directory -- after the install has repaired the files
-    #    whose mode is its own to assert.
-    if repair is not None:
-        repair(spool, spool_gid)
+    # 2. The audit directory, judged as the install will leave it and
+    #    without writing: audit_dir_blockers() does not refuse over a path
+    #    spool_mode_repairs() lists, and system_execute() makes those
+    #    repairs only after the previous timer is down (#74).
     blind = unstattable_as_me(spool)
     if blind is not None:
         checks.append(Check("spool", spool, CHECK_UNKNOWN, "%s: %s" % blind))
@@ -2962,17 +2963,6 @@ def system_execute(args, env=None):
         print("# pattern -- the only part of these commands a dry run cannot")
         print("# know. Everything else is what will run:")
 
-    def repair(spool, gid):
-        # Repair before judging. These are this installer's own directory
-        # and files, and their read scope is its to assert; the preview
-        # advertises the identical list from the identical function.
-        # audit_dir_blockers() already declines to refuse over them, so the
-        # order is belt and braces -- but doing it first means the check
-        # runs against the state the operator will actually be left in.
-        # Through fds, never paths: no root write into the spool follows a
-        # link (ADR-0025).
-        repair_spool(spool, gid, dry_run=args.dry_run)
-
     # Every check, from the function the dry run calls: an install that
     # refuses something the dry run accepted is a guardrail that fails
     # exactly when it is being installed, half-applied, on a shared node.
@@ -2980,7 +2970,7 @@ def system_execute(args, env=None):
     # here as an ordinary user: for a check that user cannot make, "could
     # not check" is the honest answer and system_preview() above has already
     # said so. On the writing path _is_root() is True or we returned 3.
-    rc, _checks = preflight(args, privileged=_is_root(), repair=repair)
+    rc, _checks = preflight(args, privileged=_is_root())
     if rc != 0:
         return rc
 
@@ -2990,7 +2980,8 @@ def system_execute(args, env=None):
     # Snapshot the payload HERE: after the checks, which are pure Python and
     # cannot block, and before the first `systemctl`, which can (ADR-0006).
     # Not earlier: every refusal above returns without issuing a single
-    # command, and there are tests pinning that. Not later: placed just
+    # command or making a single root write, and there are tests pinning
+    # that. Not later: placed just
     # before the copies it would leave the window as wide as a `systemctl
     # stop --now` takes.
     # One source for both runs. A dry run gets the planned path rather than a
@@ -3011,6 +3002,19 @@ def system_execute(args, env=None):
         check=False, dry_run=args.dry_run, env=env)
     if not args.dry_run and _units_are_down(env) != 0:
         return 7
+
+    # The spool's read scope, repaired only now: after every refusal
+    # preflight makes and after the previous units are down (#74). Refusals
+    # below this point (ownership, spool creation, install.sh) come once the
+    # payload is being replaced and can follow this repair; the spool they
+    # leave is the ADR-0025 state, not a half-repair. Repaired during preflight,
+    # a refused install still re-grouped and re-moded the spool, and the old
+    # timer, still firing, could undo part of it first -- an old relink's
+    # `install -d -m 0755` keeps the setgid bit, leaving 2755. These are this
+    # installer's own directory and files; the preview lists the identical
+    # repairs from spool_mode_repairs(). Through fds, never paths: no root
+    # write into the spool follows a link (ADR-0025).
+    repair_spool(spool, args.spool_gid, dry_run=args.dry_run)
 
     # 0700 while the payload is being assembled, widened to 0755 only once
     # every check below has passed. `cp -a --no-preserve=ownership` preserves
