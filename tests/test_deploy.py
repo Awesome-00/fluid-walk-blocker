@@ -59,7 +59,7 @@ PATH_FLAGS = ("--prefix", "--unit-dir", "--spool-dir", "--audit",
               "--bashrc-file", "--zshenv-file", "--fish-conf-file")
 
 
-def recording_run(calls, active_units=(), enabled_units=()):
+def recording_run(calls, active_units=(), enabled_units=(), installer_rc=0):
     """A `run` stub that records commands and models systemd honestly.
 
     Both state queries are answered with the state WORD, because that is
@@ -69,10 +69,13 @@ def recording_run(calls, active_units=(), enabled_units=()):
     nothing enabled. Pass `active_units` for a unit that refused to stop,
     `enabled_units` for one whose `disable` left the enablement symlink
     behind -- the shape that used to slip past an is-active-only check.
+    `installer_rc` is what `install.sh --system` exits with.
     """
     def fake_run(cmd, check=True, capture=True, dry_run=False, env=None):
         calls.append(cmd)
         returncode, stdout = 0, ""
+        if cmd[-1] == "--system" and any("install.sh" in a for a in cmd):
+            returncode = installer_rc
         if cmd[:2] == ["systemctl", "is-active"]:
             if cmd[-1] in active_units:
                 returncode, stdout = 0, "active\n"
@@ -1074,6 +1077,129 @@ def test_execute_runs_the_deployed_installer_without_path_flags(
     assert teardown == [deploy.TRUSTED_SH,
                         os.path.join(args.prefix, "shim", "install.sh"),
                         "--uninstall"], teardown
+
+
+def test_a_hook_proof_failure_still_arms_the_reaper(
+        tmp_path, monkeypatch, capsys):
+    """#76. install.sh exits 4 when a required hook cannot be proven to fire,
+    over a payload that is installed and passed every trust check. The units
+    are written and the timer re-enabled -- Layer 1's upkeep must never take
+    Layer 2 down -- and the deploy still exits 4, saying which layer runs.
+    Mutation: raise on any nonzero install.sh exit, as before, and no enable
+    is issued."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    calls = []
+    monkeypatch.setattr(deploy, "run", recording_run(calls, installer_rc=4))
+    args = _args(tmp_path)
+    assert deploy.system_execute(args) == deploy.INSTALL_HOOKS_UNPROVEN == 4
+    enable = ["systemctl", "enable", "--now", deploy.TIMER_UNIT]
+    assert enable in calls, calls
+    # systemd must re-read the units this deploy just wrote before it can
+    # enable them.
+    assert ["systemctl", "daemon-reload"] in calls, calls
+    assert calls.index(["systemctl", "daemon-reload"]) < calls.index(enable)
+    assert os.path.exists(os.path.join(args.unit_dir, deploy.TIMER_UNIT))
+    err = capsys.readouterr().err
+    assert "Layer 2 is running" in err and "NOT proven" in err, err
+    # install.sh exits at the proof, before it writes a best-effort hook;
+    # "installed" alone would say otherwise.
+    assert "best-effort hook" in err and "not written" in err, err
+    assert "None" not in err.splitlines(), err
+
+
+def test_a_journal_abort_does_not_hide_the_hook_notice(
+        tmp_path, monkeypatch, capsys):
+    """journal_step() runs run() with check=True, which raises SystemExit
+    when systemd-tmpfiles fails. The timer is already armed by then, so the
+    operator must already have been told Layer 1 is not proven: the notice
+    is the only thing that says so."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    calls = []
+    monkeypatch.setattr(deploy, "run", recording_run(calls, installer_rc=4))
+
+    def aborting_journal_step(args, env=None):
+        raise SystemExit(11)
+
+    monkeypatch.setattr(deploy, "journal_step", aborting_journal_step)
+    with pytest.raises(SystemExit) as exc:
+        deploy.system_execute(_args(tmp_path))
+    assert exc.value.code == 11
+    assert ["systemctl", "enable", "--now", deploy.TIMER_UNIT] in calls, calls
+    assert "NOT proven" in capsys.readouterr().err
+
+
+def test_a_hook_proof_failure_does_not_bypass_the_ownership_gate(
+        tmp_path, monkeypatch, capsys):
+    """ADR-0008 and the runbook say exit 4 comes only after the post-install
+    ownership check clears. When that check refuses, the deploy exits 9,
+    writes no unit and enables no timer, whatever install.sh exited with."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    calls = []
+
+    def unowned_after_install(root, uid=0):
+        # The same check runs once BEFORE install.sh (exit 5, and it removes
+        # the payload); only the run after it is under test here.
+        ran = any("install.sh" in a for c in calls for a in c)
+        return [(root, "owner", "owned by uid 1000")] if ran else []
+
+    monkeypatch.setattr(deploy, "unowned_by", unowned_after_install)
+    monkeypatch.setattr(deploy, "run", recording_run(calls, installer_rc=4))
+    args = _args(tmp_path)
+    assert deploy.system_execute(args) == 9
+    assert not [c for c in calls if c[:2] == ["systemctl", "enable"]], calls
+    assert not os.path.exists(os.path.join(args.unit_dir, deploy.TIMER_UNIT))
+
+
+# 3 is install.sh's own refusal; the rest are what a script under `set -e`
+# passes through from a failing command: 1 generic, 5 and 64 near the hook
+# proof's 4, 127 a missing program, 137 a killed one. Only exactly 4 is the
+# hook proof; a test over 3 alone cannot tell `== 4` from `>= 4`.
+@pytest.mark.parametrize("installer_rc", [1, 3, 5, 64, 127, 137])
+def test_any_other_installer_failure_leaves_the_timer_off_and_says_so(
+        tmp_path, monkeypatch, capsys, installer_rc):
+    """A refusal of install.sh's own (exit 3) or any other failure keeps the
+    timer disabled, as before -- root must not keep executing a payload this
+    run did not accept -- but the operator is now told it is disabled."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    calls = []
+    monkeypatch.setattr(deploy, "run",
+                        recording_run(calls, installer_rc=installer_rc))
+    with pytest.raises(SystemExit) as exc:
+        deploy.system_execute(_args(tmp_path))
+    assert exc.value.code == installer_rc
+    assert not [c for c in calls if c[:2] == ["systemctl", "enable"]], calls
+    err = capsys.readouterr().err
+    assert "STILL DISABLED" in err and deploy.TIMER_UNIT in err, err
+
+
+def test_a_failed_uncaptured_command_prints_no_stray_none(capsys):
+    """run(capture=False) has no stderr to print: the command already wrote
+    its own to the terminal. It used to print result.stderr regardless, and
+    the operator saw a line reading `None`."""
+    with pytest.raises(SystemExit) as exc:
+        deploy.run([sys.executable, "-c", "import sys; sys.exit(7)"],
+                   capture=False)
+    assert exc.value.code == 7
+    err = capsys.readouterr().err
+    assert err.startswith("failed: ") and "None" not in err.splitlines(), err
+
+
+def test_a_failed_captured_command_prints_its_stderr_once(capsys):
+    """The other half of the `None` fix: when stderr WAS captured it is still
+    shown, once, on a line of its own. The command's stderr here has no
+    trailing newline, the only input on which the normalisation shows."""
+    with pytest.raises(SystemExit) as exc:
+        deploy.run([sys.executable, "-c",
+                    # Built at run time: the echoed command line must not
+                    # contain the marker the assertion counts.
+                    "import sys; sys.stderr.write('bo' + 'om'); sys.exit(7)"])
+    assert exc.value.code == 7
+    err = capsys.readouterr().err
+    assert err.count("boom") == 1 and err.endswith("boom\n"), err
 
 
 def test_the_post_install_message_names_both_trails_and_the_record(
