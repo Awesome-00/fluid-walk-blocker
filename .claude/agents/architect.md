@@ -120,6 +120,7 @@ Automated review keeps rediscovering these. Refute them by citation, not by re-l
 | 0025 | The spool is `root:<spool_group> 02750`; a listed, human-free service group may hold write on a spool ancestor only; root's spool writes never follow a link, and go only into a spool carrying deploy.py's marker (narrows 0012 and 0019, clarifies 0004) |
 | 0026 | `[install].journal_readable` (off by default) grants the spool group read on the WHOLE journal via a tmpfiles.d drop-in naming the gid; the deploy proves it on each root, `%m` and its files, and exits 10 if it did not land; turning it off or uninstalling revokes the gids the drop-in records |
 | 0027 | `--uninstall` refuses (exit 6, before any command) unless the installed `<prefix>/site.toml` hashes to the build's compiled `SITE_SHA256`; hashed, never parsed; no override; VERSION not compared; the install never refuses; one install per node (narrows 0013) |
+| 0028 | `orphan_traversal` requires the same `[reaper].traversal_budget_s` as `runaway_traversal`; reparented to init is not proof the output is unwanted; the budget does not gate fan-out membership |
 
 ## Non-negotiables a prompt must restate
 
