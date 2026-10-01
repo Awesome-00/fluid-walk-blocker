@@ -7,7 +7,11 @@
                                          privilege, and says which checks it
                                          could not make as an ordinary user
     python3 deploy.py --uninstall        as root, reverse a --system install
-    python3 deploy.py --verify           compare the installed files against
+    python3 deploy.py --uninstall --dry-run
+                                         make the uninstall's checks and PRINT
+                                         its commands, writing nothing; needs
+                                         no privilege, like the install's
+    python3 deploy.py --verify          compare the installed files against
                                          the record they were built from
     python3 deploy.py --version
 
@@ -50,9 +54,11 @@ already root, checked with `os.geteuid()` and not reimplemented. There is no
 second authorization flag. Whoever holds root on the target node has the
 authority this installs with, and a script that demanded a further ceremony
 from them would be gainsaying a judgement that is not its to make (ADR-0021,
-narrowing ADR-0004). `--uninstall` is root alone for the same reason it
-always was: reversing a control is the safer direction. It is not gated on
-anything else, but it does refuse an install whose `site.toml` is not the
+narrowing ADR-0004). The uninstall that writes is root alone for the same
+reason it always was: reversing a control is the safer direction. Its dry
+run, like the install's, writes nothing and so needs no privilege; a check
+it could not make as an ordinary user is named rather than reported clean.
+The uninstall is not gated on anything else, but it does refuse an install whose `site.toml` is not the
 configuration this build was compiled from, since every path it would tear
 down is this build's literal (ADR-0027). That guards against the wrong
 payload, not against root.
@@ -80,6 +86,16 @@ and may not make one of those stats it says "could not be checked as this
 user" rather than reporting it clean; run as root, that same answer is a
 refusal. A dry run stages nothing, so the staging parent is the one check
 it does not make -- in the dry run and in the install alike.
+
+Both also check the PAYLOAD against its own record (ADR-0029): every
+`PAYLOAD_SOURCES` entry is there with its type, nothing extra sits in `shim/`
+or `docs/`, every file hashes to its `site.lock.json` entry, and the lock
+names this build's `SITE_SHA256` and version. The dry run checks the payload
+directory it runs from; the install checks the root-only snapshot it copies
+from, once the snapshot is taken and before its first `systemctl`. Either
+refuses with exit 6. That catches a truncated or partial copy; it is no
+control against the payload's owner, who can rewrite the files and the lock
+together (ADR-0006).
 
 Exit 10 is not a refusal: it is reported after the install, timer armed,
 when the journal grant (ADR-0026) did not land -- which only a written ACL
@@ -119,8 +135,12 @@ __version__ = '@@VERSION@@'  # GENERATED from VERSION
 # INSTALLED `<prefix>/site.toml` against it and refuses on a mismatch, so a
 # payload built from some other configuration cannot tear this install down
 # with paths it never wrote (ADR-0027). A literal for the same reason as the
-# version: the payload's own lock is a user-owned file, and reading it here
-# would be a late read of bytes its owner can rewrite (ADR-0006).
+# version: identity comes from the program already loaded, never from the
+# payload's own lock, which is a user-owned file its owner can rewrite
+# (ADR-0006). That lock IS read, for integrity and nothing else: the dry run
+# reads the payload's, the install reads its root-only snapshot's, and both
+# refuse unless the lock names this digest and every payload file hashes to
+# its entry (ADR-0029). It catches a bad copy, not the payload's owner.
 SITE_SHA256 = '@@SITE_SHA256@@'  # GENERATED from SITE_SHA256
 
 # The payload IS the directory this file is in.
@@ -770,26 +790,28 @@ def system_preview(args, env=None):
     # run as root first, and is also perfectly runnable by the operator as
     # themselves. A root dry run can see everything the install will, so for
     # it "could not check" is the refusal it is for the install.
-    rc, checks = preflight(args, privileged=_is_root())
+    privileged = _is_root()
+    rc, checks = preflight(args, privileged=privileged)
     if rc != 0:
         sys.stderr.write(
             "deploy.py: the install would refuse too, so no command is "
             "advertised here.\n")
         return rc
 
-    # Never silently: a check nobody could make is not a check that passed,
-    # and the whole contract of this dry run is that reading it is enough.
+    # The payload this would install, against its own record (ADR-0029). The
+    # install makes the same check on its snapshot, which a dry run does not
+    # take, so here it is made on the directory the snapshot would be copied
+    # from: a truncated or partial copy refuses now rather than mid-install.
+    blocked, payload_unknown = payload_blockers(REPO, privileged=privileged)
+    if blocked:
+        write_payload_refusal(REPO, blocked)
+        sys.stderr.write(
+            "deploy.py: the install would refuse too, so no command is "
+            "advertised here.\n")
+        return 6
+
     unknown = [check for check in checks if check.state == CHECK_UNKNOWN]
-    if unknown:
-        print()
-        print("# NOT CHECKED. This dry run is running as a user who may not")
-        print("# inspect these paths, so the following were not made -- which")
-        print("# is not the same as made and passed. Re-run the dry run as")
-        print("# root to make them before deploying:")
-        for check in unknown:
-            print("#   %s (%s): could not be checked as this user -- %s"
-                  % (check.subject, check.name, check.reason))
-        print()
+    write_not_checked(unknown + payload_unknown)
 
     print("# Run as root, without --dry-run, to actually install:")
     # No path flags to forward, and that is the fix rather than a
@@ -1952,7 +1974,24 @@ def write_unusable_staging_refusal(parent, reason, out=None):
         "`systemctl` has nowhere to go.\n" % (parent, reason))
 
 
-def write_unknown_refusal(unknowns, out=None):
+def write_not_checked(unknowns, before="deploying", out=None):
+    """The dry run's NOT CHECKED block, said once for both dry runs. Never
+    silently: a check nobody could make is not a check that passed, and the
+    whole contract of a dry run is that reading it is enough."""
+    if not unknowns:
+        return
+    out = sys.stdout if out is None else out
+    out.write("\n# NOT CHECKED. This dry run is running as a user who may not\n"
+              "# inspect these paths, so the following were not made -- which\n"
+              "# is not the same as made and passed. Re-run the dry run as\n"
+              "# root to make them before %s:\n" % before)
+    for check in unknowns:
+        out.write("#   %s (%s): could not be checked as this user -- %s\n"
+                  % (check.subject, check.name, check.reason))
+    out.write("\n")
+
+
+def write_unknown_refusal(unknowns, out=None, action="install"):
     """A check root itself could not make. Returns 6, to be returned on.
 
     Unreachable in practice -- root is not subject to the permission bits
@@ -1964,9 +2003,9 @@ def write_unknown_refusal(unknowns, out=None):
     """
     out = sys.stderr if out is None else out
     out.write(
-        "deploy.py: refusing to install: a check could not be made even as "
+        "deploy.py: refusing to %s: a check could not be made even as "
         "root, and a\n  check that could not be made is not a check that "
-        "passed:\n")
+        "passed:\n" % action)
     for check in unknowns:
         out.write("  %s (%s): %s\n" % (check.subject, check.name,
                                        check.reason))
@@ -1987,6 +2026,13 @@ def preflight(args, privileged, out=None):
     the staging parent, is also the only one a dry run does not make, because
     `stage_payload()` does not make it either -- a dry run creates no
     snapshot, so it has no parent to judge.
+
+    The payload's own check against its record is NOT here, because its
+    subject differs by caller: `system_preview()` runs `payload_blockers()`
+    on the payload directory right after this returns, and `stage_payload()`
+    runs it on the snapshot it just took (ADR-0029). Checking the payload
+    directory here, for the install, would be a second read of user-owned
+    bytes after the one the snapshot makes (ADR-0006).
 
     `privileged` is a fact about the CALLER, not a mode. The install runs as
     root and can inspect everything; the preview runs as whoever reads it. A
@@ -2202,6 +2248,214 @@ def preflight(args, privileged, out=None):
     return 0, checks
 
 
+def _payload_file_digest(path):
+    """The sha256 of the regular file at `path`, or None when it is not one.
+
+    Not `_sha256_file()`, which `--verify` uses: that follows a link and
+    blocks opening a FIFO. O_NOFOLLOW for a link swapped in after the
+    caller's lstat; O_NONBLOCK so a FIFO cannot hang the open, and the fstat
+    then refuses it. Chunked for 3.9 (ADR-0015). Raises OSError.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, _VERIFY_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _irregular_kind(info):
+    """What a non-regular lstat result is, for a refusal line."""
+    if stat.S_ISLNK(info.st_mode):
+        return "a symlink"
+    if stat.S_ISDIR(info.st_mode):
+        return "a directory"
+    return "not a regular file"
+
+
+def payload_blockers(root, privileged):
+    """`(blocked, unknown)` for the payload under `root`, judged against the
+    `site.lock.json` beside it (ADR-0029).
+
+    `blocked` is a list of lines, one per thing that differs -- `missing:`,
+    `extra:`, `wrong type:`, `differs:`, `unreadable:`, or the record itself
+    -- and any of them refuses, exit 6. `unknown` is a list of Checks for
+    what this process was not PERMITTED to read; `privileged` turns each of
+    those into a blocker instead, exactly as preflight() does.
+
+    An INTEGRITY read, not configuration (ADR-0013): no value in the lock
+    reaches a path, a threshold or any branch but this refusal, and the lock
+    is never an identity -- it must name the `SITE_SHA256` and `__version__`
+    compiled into this program, which is where identity comes from. Called
+    on the payload directory by the dry run and on the root-only snapshot by
+    the install, never on the payload directory by the install (ADR-0006).
+    It catches a bad copy; the payload's owner can rewrite the files, the
+    lock and deploy.py together, and nothing here pretends otherwise.
+
+    Every name is lstat'ed before it is opened, so a link is reported rather
+    than followed and a FIFO is reported rather than opened. Modes are not
+    compared: the install sets them.
+    """
+    blocked, unknown = [], []
+
+    def cannot_read(rel, exc):
+        if exc.errno in (errno.EACCES, errno.EPERM) and not privileged:
+            unknown.append(Check("payload", os.path.join(root, rel),
+                                 CHECK_UNKNOWN, "%s: %s" % (rel, exc.strerror)))
+        else:
+            blocked.append("unreadable: %s (%s)" % (rel, exc.strerror))
+
+    # 1. Each entry's type, by lstat, before anything is opened.
+    fit = set()
+    for rel, is_dir, _mode in PAYLOAD_SOURCES:
+        try:
+            info = os.lstat(os.path.join(root, rel))
+        except FileNotFoundError:
+            blocked.append("missing: %s" % rel)
+            continue
+        except OSError as exc:
+            cannot_read(rel, exc)
+            continue
+        if is_dir and stat.S_ISDIR(info.st_mode):
+            fit.add(rel)
+        elif not is_dir and stat.S_ISREG(info.st_mode):
+            fit.add(rel)
+        else:
+            blocked.append("wrong type: %s is %s, not a %s"
+                           % (rel, _irregular_kind(info),
+                              "directory" if is_dir else "regular file"))
+
+    # 2. The record. Opened only once it is known to be a regular file, so
+    #    read_installed_lock()'s plain open cannot block on a FIFO; probed
+    #    first so a permission answer is told apart from a record that will
+    #    not parse. Without it nothing below can be judged, and step 1 has
+    #    already said why it is unfit.
+    if "site.lock.json" not in fit:
+        return blocked, unknown
+    try:
+        _payload_file_digest(os.path.join(root, "site.lock.json"))
+    except OSError as exc:
+        cannot_read("site.lock.json", exc)
+        return blocked, unknown
+    lock = read_installed_lock(root)
+    if lock is None:
+        blocked.append("site.lock.json is not a record this can read, or it "
+                       "names a path outside the payload: it cannot vouch "
+                       "for the payload")
+        return blocked, unknown
+    if lock.get("site_sha256") != SITE_SHA256:
+        blocked.append("differs: site.lock.json records site_sha256 %s, and "
+                       "this build was compiled from %s"
+                       % (lock.get("site_sha256"), SITE_SHA256))
+    if lock["files"].get("site.toml") != SITE_SHA256:
+        blocked.append("differs: site.lock.json's site.toml entry is not "
+                       "this build's SITE_SHA256")
+    if lock.get("version") != __version__:
+        blocked.append("differs: site.lock.json records version %s, and this "
+                       "build is %s" % (lock.get("version"), __version__))
+
+    # 3. Every file against its entry. site.lock.json cannot hash itself, and
+    #    entries outside PAYLOAD_SOURCES -- deploy.py, which runs from here
+    #    and is never installed -- are not this check's.
+    expected, _not_installed = expected_from_lock(lock)
+
+    def judge(rel, walked=False):
+        try:
+            digest = _payload_file_digest(os.path.join(root, rel))
+        except OSError as exc:
+            cannot_read(rel, exc)
+            return
+        if digest is None:
+            blocked.append("wrong type: %s is not a regular file" % rel)
+        elif rel not in expected:
+            blocked.append(("extra: %s (no site.lock.json entry, and `cp -a` "
+                            "would install it)" if walked else
+                            "unrecorded: %s (no site.lock.json entry)") % rel)
+        elif digest != expected[rel]:
+            blocked.append("differs: %s does not hash to its site.lock.json "
+                           "entry" % rel)
+
+    for rel, is_dir, _mode in PAYLOAD_SOURCES:
+        if is_dir or rel == "site.lock.json" or rel not in fit:
+            continue
+        judge(rel)
+
+    # 4. The directory entries, walked by lstat on every name: `cp -a`
+    #    copies whatever is there, so an extra file is installed, and a link
+    #    or a FIFO is installed as one.
+    seen, unwalked = set(), []
+    for rel, is_dir, _mode in PAYLOAD_SOURCES:
+        if not is_dir or rel not in fit:
+            if is_dir:
+                unwalked.append(rel)
+            continue
+        pending = [rel]
+        while pending:
+            here = pending.pop()
+            try:
+                names = sorted(os.listdir(os.path.join(root, here)))
+            except OSError as exc:
+                cannot_read(here, exc)
+                unwalked.append(here)
+                continue
+            for name in names:
+                child = here + "/" + name
+                try:
+                    info = os.lstat(os.path.join(root, child))
+                except OSError as exc:
+                    cannot_read(child, exc)
+                    unwalked.append(child)
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(child)
+                elif stat.S_ISREG(info.st_mode):
+                    seen.add(child)
+                    judge(child, walked=True)
+                else:
+                    # Not followed, so whatever the record lists below it
+                    # is accounted for by this line rather than listed as
+                    # missing one entry at a time.
+                    blocked.append("wrong type: %s is %s"
+                                   % (child, _irregular_kind(info)))
+                    seen.add(child)
+                    unwalked.append(child)
+    for rel in sorted(expected):
+        if rel in seen or not any(rel.startswith(d + "/")
+                                  for d, is_dir, _m in PAYLOAD_SOURCES
+                                  if is_dir):
+            continue
+        if any(rel == u or rel.startswith(u + "/") for u in unwalked):
+            continue
+        blocked.append("missing: %s" % rel)
+    return blocked, unknown
+
+
+def write_payload_refusal(root, blocked, snapshot=None, out=None):
+    """Said once, so the dry run and the install say it the same way. The
+    install names its snapshot too, since that is what it judged and the
+    snapshot is removed at exit."""
+    out = sys.stderr if out is None else out
+    out.write("deploy.py: refusing the payload at %s: it does not match its "
+              "own site.lock.json\n  (ADR-0029). A copy that was interrupted "
+              "or truncated looks like this.\n" % root)
+    if snapshot is not None:
+        out.write("  Judged on the root-only snapshot of it, %s:\n" % snapshot)
+    for line in blocked[:20]:
+        out.write("  %s\n" % line)
+    if len(blocked) > 20:
+        out.write("  ... and %d more\n" % (len(blocked) - 20))
+    out.write("  Copy the payload again from the build, preserving it whole "
+              "(`tar -p`, not a\n  partial `scp`), and re-run. Nothing has "
+              "been touched.\n")
+
+
 def stage_payload(env=None, dry_run=False):
     """Snapshot the payload into a root-only directory and return its path.
 
@@ -2229,7 +2483,13 @@ def stage_payload(env=None, dry_run=False):
     of the same user-owned directory, read by the same root process, one
     moment earlier. Do not re-open this as a hardening patch.
 
-    0700 and owned by root, since it holds bytes not yet verified.
+    0700 and owned by root, since it holds bytes not yet verified -- until
+    `payload_blockers()` has judged the SNAPSHOT against its own record,
+    which happens here, after the copies and before the caller's first
+    `systemctl` (ADR-0029). Any difference, including a source the copy
+    could not find, is exit 6 with nothing touched. The snapshot is what is
+    hashed, never the payload directory: that would be a second, later read
+    of user-owned bytes.
     """
     if dry_run:
         # A dry run must not create anything, so it has no snapshot and no
@@ -2275,12 +2535,26 @@ def stage_payload(env=None, dry_run=False):
         target = os.path.join(staging, relative)
         run(["install", "-d", "-m", "0700", os.path.dirname(target)],
             dry_run=dry_run, env=env)
+        # check=False, and the failure relayed rather than raised: a source
+        # the copy cannot find is a payload that does not match its record,
+        # and the check below says so with the exit the dry run predicted
+        # (6), where raising here would pass the copy's own status through.
         if is_dir:
-            run(["cp", "-a", "--no-preserve=ownership", source, target],
-                dry_run=dry_run, env=env)
+            copy = ["cp", "-a", "--no-preserve=ownership", source, target]
         else:
-            run(["install", "-m", "0600", source, target],
-                dry_run=dry_run, env=env)
+            copy = ["install", "-m", "0600", source, target]
+        copied = run(copy, check=False, dry_run=dry_run, env=env)
+        if copied.returncode != 0:
+            sys.stderr.write("failed: %s\n" % " ".join(shlex.quote(c)
+                                                       for c in copy))
+            if copied.stderr:
+                sys.stderr.write(copied.stderr.rstrip("\n") + "\n")
+    # The snapshot against its own record, as root: a check root could not
+    # make is a refusal like any other here.
+    blocked, _unknown = payload_blockers(staging, privileged=True)
+    if blocked:
+        write_payload_refusal(REPO, blocked, snapshot=staging)
+        raise SystemExit(6)
     return staging
 
 
@@ -2322,9 +2596,18 @@ def installed_config_refusal(prefix):
     can fail to vouch for the install refuses, because an install that cannot
     show its configuration cannot be shown to be the one this payload would
     undo. The installed file is 0644 under a 0755 prefix, so none of this
-    needs root -- which the dry run will rely on once it runs without it.
+    needs root, and the uninstall's dry run makes it as whoever runs it.
+
+    The third outcome is a raised PermissionError: this process was not
+    PERMITTED to look (EACCES or EPERM, on the way to the file or opening
+    it). That is not an answer about the install, so it is not returned as
+    one. The caller decides: the unprivileged dry run reports it as not
+    checked, and a privileged caller refuses on it as on any other reason.
     """
     path = os.path.join(prefix, "site.toml")
+    blind = unstattable_as_me(path)
+    if blind is not None:
+        raise PermissionError(errno.EACCES, blind[1], blind[0])
     bad = irregular_target(path)
     if bad is not None:
         return ("%s %s" % (path, bad), None)
@@ -2338,6 +2621,8 @@ def installed_config_refusal(prefix):
         # O_NOFOLLOW for a link swapped in after the lstat; O_NONBLOCK so a
         # FIFO swapped in cannot hang the open, and the fstat refuses it.
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except PermissionError:
+        raise
     except OSError as err:
         return ("%s cannot be read (%s)" % (path, err.strerror), None)
     try:
@@ -2349,6 +2634,8 @@ def installed_config_refusal(prefix):
             if not chunk:
                 break
             digest.update(chunk)
+    except PermissionError:
+        raise
     except OSError as err:
         # Never a match: an unreadable file vouches for nothing.
         return ("%s cannot be read (%s)" % (path, err.strerror), None)
@@ -3237,7 +3524,20 @@ def system_execute(args, env=None):
 
     # Last, after the timer is armed: the grant is about who can READ
     # Layer 1's records, and a failure in it must not cost the node Layer 2.
-    rc = journal_step(args, env=env)
+    try:
+        rc = journal_step(args, env=env)
+    except SystemExit:
+        # run() has already written the failed command and its stderr, so
+        # the journal's failure is reported; under an unproven hook it does
+        # not get the exit status as well (worst case wins, below).
+        if not hooks_unproven:
+            raise
+        return INSTALL_HOOKS_UNPROVEN
+    # Worst case wins. When more than one step fails, the exit status is the
+    # most severe and the rest are reported on stderr only: a hook-proof
+    # failure (4) outranks a journal step that did not land (10, or a
+    # command's own status), whose explanation journal_step() has written
+    # above. Swapping these two returns would let the journal hide the hook.
     if hooks_unproven:
         return INSTALL_HOOKS_UNPROVEN
     if rc != 0:
@@ -3273,9 +3573,21 @@ def system_execute(args, env=None):
 
 
 def system_uninstall(args, env=None):
-    if not _is_root():
+    # The uninstall that WRITES is root alone. Its dry run writes nothing, so
+    # it needs no privilege, for the reason ADR-0021 gives the install's: an
+    # operator diagnosing a node should be able to read what an uninstall
+    # would undo without becoming root first (issue #53).
+    if not args.dry_run and not _is_root():
         sys.stderr.write("deploy.py: --uninstall must run as root\n")
         return 3
+    # A fact about the CALLER, as in preflight(): a check this process was
+    # not permitted to make is reported by an unprivileged dry run and
+    # refused by anyone with privilege. On the writing path it is True.
+    privileged = _is_root()
+    unknown = []
+
+    def refuse_unknown():
+        return write_unknown_refusal(unknown, action="uninstall")
 
     # install.sh derives BIN=$PREFIX/bin and removes every shim link in it,
     # so a careless prefix once deleted system binaries as root. That whole
@@ -3287,13 +3599,29 @@ def system_uninstall(args, env=None):
     # checks the install path applies. A disabled hook's file is validated
     # all the same -- the cost is a stat, and a hand-edited copy that
     # re-enables it would otherwise reach strip_block() unchecked. The spool
-    # is excluded because uninstall does not touch it.
-    if validate_root_write_paths(
-            args, attrs=("prefix", "unit_dir", "tmpfiles_dir", "bashrc_file",
-                         "zshenv_file", "fish_conf_file")) != 0:
+    # is excluded because uninstall does not touch it. Scoped to the paths
+    # this process may inspect, as preflight() scopes the install's.
+    inspectable = []
+    for attr in ("prefix", "unit_dir", "tmpfiles_dir", "bashrc_file",
+                 "zshenv_file", "fish_conf_file"):
+        blind = unstattable_as_me(getattr(args, attr))
+        if blind is None:
+            inspectable.append(attr)
+        else:
+            unknown.append(Check("paths", getattr(args, attr), CHECK_UNKNOWN,
+                                 "%s: %s" % blind))
+    if privileged and unknown:
+        return refuse_unknown()
+    if validate_root_write_paths(args, attrs=inspectable) != 0:
         return 6
     dropin = journal_dropin_path(args)
-    if dropin_blocker(dropin) is not None:
+    blind = unstattable_as_me(dropin)
+    if blind is not None:
+        unknown.append(Check("journal_dropin", dropin, CHECK_UNKNOWN,
+                             "%s: %s" % blind))
+        if privileged:
+            return refuse_unknown()
+    elif dropin_blocker(dropin) is not None:
         return 6
 
     # Same rule as the install: a teardown pointed elsewhere would `rm -f`
@@ -3305,8 +3633,15 @@ def system_uninstall(args, env=None):
 
     # And it has to be OUR install. Without the marker a lookalike directory
     # passes every check above, and install.sh then removes what sits in its
-    # bin/.
-    if not os.path.exists(os.path.join(args.prefix, PAYLOAD_MARKER)):
+    # bin/. An lstat with its errno split, not os.path.exists(), which answers
+    # False for "not permitted to look" as well as for "not there".
+    marker = os.path.join(args.prefix, PAYLOAD_MARKER)
+    blind = unstattable_as_me(marker)
+    if blind is not None:
+        unknown.append(Check("marker", marker, CHECK_UNKNOWN, "%s: %s" % blind))
+        if privileged:
+            return refuse_unknown()
+    elif not os.path.lexists(marker):
         sys.stderr.write(
             "deploy.py: refusing prefix=%s: no %s marker, so this is not a\n"
             "  directory walk-blocker installed. Uninstalling would `rm -f`\n"
@@ -3322,10 +3657,36 @@ def system_uninstall(args, env=None):
     # from the same site.toml. Checked in the dry run too, so the preview
     # reaches the same answer; and before the first command, like every
     # refusal above (ADR-0027).
-    reason, installed = installed_config_refusal(args.prefix)
+    config = os.path.join(args.prefix, "site.toml")
+    try:
+        reason, installed = installed_config_refusal(args.prefix)
+    except PermissionError as exc:
+        if privileged:
+            write_installed_config_refusal(
+                args.prefix, "%s cannot be read (%s)" % (config, exc.strerror),
+                None)
+            return 6
+        unknown.append(Check("configuration, ADR-0027", config, CHECK_UNKNOWN,
+                             "%s: %s" % (exc.filename or config,
+                                         exc.strerror)))
+        reason = None
     if reason is not None:
         write_installed_config_refusal(args.prefix, reason, installed)
         return 6
+
+    # The gids an earlier deploy granted, read BEFORE the first command so
+    # that a drop-in root cannot read refuses with nothing touched.
+    try:
+        granted = dropin_gids(dropin)
+    except PermissionError as exc:
+        if privileged:
+            sys.stderr.write("deploy.py: refusing to uninstall: the journal "
+                             "drop-in %s cannot be read (%s).\n"
+                             % (dropin, exc.strerror))
+            return 6
+        unknown.append(Check("journal_dropin", dropin, CHECK_UNKNOWN,
+                             "%s: %s" % (dropin, exc.strerror)))
+        granted = set()
 
     run(["systemctl", "disable", "--now", TIMER_UNIT],
         check=False, dry_run=args.dry_run, env=env)
@@ -3356,7 +3717,6 @@ def system_uninstall(args, env=None):
                         "have the removed units loaded")
     # Whatever the compiled flag says now: the drop-in records which gids an
     # earlier deploy granted, and those are what get revoked (ADR-0026).
-    granted = dropin_gids(dropin)
     if granted:
         if run(["rm", "-f", dropin], check=False,
                dry_run=args.dry_run, env=env).returncode != 0:
@@ -3369,8 +3729,23 @@ def system_uninstall(args, env=None):
                                     "%s" % root)
     # The DEPLOYED helper, verified, and no fallback to this directory. The
     # marker check above has already established that the prefix is one
-    # walk-blocker installed.
-    helper, why = uninstall_helper(args.prefix)
+    # walk-blocker installed. An unprivileged dry run that may not look at
+    # the helper names it as not checked and prints the command it would
+    # run; with privilege, not being able to look is the refusal below.
+    helper_dir = os.path.join(args.prefix, "shim")
+    blind = None
+    if not privileged:
+        for name in ("install.sh", "wrapped_names.sh"):
+            blind = unstattable_as_me(os.path.join(helper_dir, name))
+            if blind is not None:
+                break
+    if blind is not None:
+        unknown.append(Check("teardown_helper",
+                             os.path.join(helper_dir, "install.sh"),
+                             CHECK_UNKNOWN, "%s: %s" % blind))
+        helper, why = os.path.join(helper_dir, "install.sh"), None
+    else:
+        helper, why = uninstall_helper(args.prefix)
     if helper is None:
         hooks = enabled_hook_files(args)
         sys.stderr.write(
@@ -3412,6 +3787,7 @@ def system_uninstall(args, env=None):
             sys.stderr.write("  %s\n" % failure)
         return 8
 
+    write_not_checked(unknown, before="uninstalling")
     print("\nremoved. the audit trail under %s is left in place." % args.spool_dir)
     return 0
 
@@ -3695,9 +4071,9 @@ def main(argv=None):
                       help="compare the installed files against the record "
                            "they were built from; writes nothing")
     parser.add_argument("--dry-run", action="store_true",
-                        help="with --system: make every check and print the "
-                             "commands without running any of them; writes "
-                             "nothing and needs no privilege")
+                        help="with --system or --uninstall: make every check "
+                             "and print the commands without running any of "
+                             "them; writes nothing and needs no privilege")
     args = parser.parse_args(argv)
 
     # The seven locations are deliberately NOT options. argparse rejects
