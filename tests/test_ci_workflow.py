@@ -267,3 +267,39 @@ def test_a_ratio_run_that_compared_carries_no_warning(tmp_path):
     assert "compared 8/8 usable pairs" in summary, summary
     assert "=== 8/8 usable pairs ===" in summary, summary
     assert "fast-path ratio (median)" in summary, summary
+
+
+def test_the_matrix_reaches_the_newest_interpreters():
+    """Issue #130: a failure that exists only from 3.13 or 3.14 passed CI
+    while the matrix stopped at 3.12, though `uv run` on a current
+    workstation resolves 3.14."""
+    versions = _jobs()["test"]["strategy"]["matrix"]["python-version"]
+    assert [str(v) for v in versions] == [
+        "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"], (
+        "the test matrix is %r. 3.9 is the node floor (ADR-0015) and 3.14 is "
+        "what a workstation resolves; both ends are load-bearing" % versions)
+
+
+def test_one_row_runs_the_banner_tests_with_colour_forced():
+    """The CI oracle for the autouse colour fixture in tests/conftest.py
+    (issue #93). Only 3.14 argparse colours `--help`, and only when the
+    environment forces it, so without this step deleting the fixture fails
+    no CI run. FORCE_COLOR must reach the child through runuser's `env`
+    list: set anywhere else, it does not survive runuser and the step runs
+    the tests uncoloured and passes vacuously."""
+    steps = [s for s in _steps("test") if "FORCE_COLOR" in _text(s)]
+    assert len(steps) == 1, (
+        "expected exactly one step in the test job that forces colour, found "
+        "%d" % len(steps))
+    step = steps[0]
+    assert "3.14" in str(step.get("if", "")) and \
+        "matrix.python-version" in str(step.get("if", "")), (
+        "the forced-colour step is not keyed to the 3.14 row: %r"
+        % step.get("if"))
+    body = str(step.get("run", ""))
+    assert "runuser -u ciuser" in body, (
+        "the forced-colour step does not run as the non-root user")
+    assert "FORCE_COLOR=3" in body.split("uv run", 1)[0], (
+        "FORCE_COLOR=3 is not in runuser's env list ahead of `uv run`")
+    assert "tests/test_banner.py" in body, (
+        "the forced-colour step does not run the banner tests")
