@@ -124,7 +124,7 @@ import tempfile
 # by `walk-blocker build`; the values in the tree are sentinels, and a
 # payload carries the site's. `walk-blocker build --check` reports a stale
 # or missing one. Nothing on the node reads configuration.
-__version__ = '0.3.1'  # GENERATED from VERSION
+__version__ = '0.3.2'  # GENERATED from VERSION
 # One payload, one number: installer, reaper, shim and walk-job ship together
 # and carry one version, because they are deployed as one and a per-file
 # version would invite mixing them. A literal, NOT read at run time: this
@@ -141,7 +141,7 @@ __version__ = '0.3.1'  # GENERATED from VERSION
 # reads the payload's, the install reads its root-only snapshot's, and both
 # refuse unless the lock names this digest and every payload file hashes to
 # its entry (ADR-0029). It catches a bad copy, not the payload's owner.
-SITE_SHA256 = 'a1112c21b63c7199238a68326c44315b80b749ace4e02dc876f8a2c1c179337b'  # GENERATED from SITE_SHA256
+SITE_SHA256 = '6207768970a539dd62fa998900668fa33da02b4ce98f72a06574c3e339e95f2a'  # GENERATED from SITE_SHA256
 
 # The payload IS the directory this file is in.
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -1330,6 +1330,11 @@ SPOOL_MARKER = ".walk-blocker-spool"
 # carries the same literal as UNCOVERED_NAME, and a test pins that they agree.
 UNCOVERED_NAME = "uncovered-mounts.state"
 
+# The relink's memory of what has been linked since the install (ADR-0031):
+# coverage drift as a standing condition. install.sh carries the same
+# literal as LINKED_NAME, and a test pins that they agree.
+LINKED_NAME = "linked-names.state"
+
 INSTALLER_OWNED_SPOOL_NAMES = (
     SPOOL_MARKER,                   # the spool's identity, above
     "reaper-state.json",            # Layer 2's latch
@@ -1338,6 +1343,8 @@ INSTALLER_OWNED_SPOOL_NAMES = (
     "reaper-audit.jsonl.1",         # ...and its one rotation
     UNCOVERED_NAME,                 # the relink's memory (ADR-0019)
     UNCOVERED_NAME + ".new",        # ...and its write-and-rename
+    LINKED_NAME,                    # the linked-set memory (ADR-0031)
+    LINKED_NAME + ".new",           # ...and its write-and-rename
 )
 
 
@@ -3567,9 +3574,24 @@ def system_execute(args, env=None):
         write_unit(service_path, service)
         write_unit(timer_path, timer)
 
-    run(["systemctl", "daemon-reload"], dry_run=args.dry_run, env=env)
-    run(["systemctl", "enable", "--now", TIMER_UNIT],
-        dry_run=args.dry_run, env=env)
+    try:
+        run(["systemctl", "daemon-reload"], dry_run=args.dry_run, env=env)
+        run(["systemctl", "enable", "--now", TIMER_UNIT],
+            dry_run=args.dry_run, env=env)
+    except SystemExit:
+        # Issue #145. run() has reported the command; the hook failure would
+        # otherwise go unreported by this script, because the notice below
+        # is never reached. The command's status still wins over 4: exit 4
+        # promises Layer 2 is running, and here it is not known to be.
+        if hooks_unproven:
+            sys.stderr.write(
+                "\ndeploy.py: Layer 1 NOT proven AND Layer 2 NOT armed.\n"
+                "  install.sh could not prove a required hook fires, and the\n"
+                "  systemctl command above failed, so %s is not known\n"
+                "  to be running: neither layer can be relied on. A best-effort\n"
+                "  hook was not written either. Fix both causes above, then\n"
+                "  re-run this install.\n" % TIMER_UNIT)
+        raise
 
     # Told BEFORE the journal step, not after: journal_step() can end the run
     # through run()'s SystemExit, and this notice is the only thing that says
@@ -3779,7 +3801,22 @@ def system_uninstall(args, env=None):
     else:
         helper, why = uninstall_helper(args.prefix)
     if helper is None:
-        hooks = enabled_hook_files(args)
+        # Name only the hook steps this site has (issue #142): the fish
+        # drop-in exists only when the fish hook is enabled, and a site with
+        # no hook enabled has no hook step at all.
+        shared = [getattr(args, attr) for attr, shell, enabled in hook_table()
+                  if enabled and shell != "fish"]
+        fish = [getattr(args, attr) for attr, shell, enabled in hook_table()
+                if enabled and shell == "fish"]
+        hook_steps = ""
+        if shared:
+            hook_steps += ("  strip the block between the walk-blocker markers"
+                           " in %s;\n" % ", ".join(shared))
+        if fish:
+            hook_steps += ("  remove the fish drop-in %s outright (the whole"
+                           " file is\n  walk-blocker's);\n" % fish[0])
+        if not hook_steps:
+            hook_steps = "  no hook file to clean, since this site enables none;\n"
         sys.stderr.write(
             "deploy.py: refusing to run the teardown helper: %s\n" % why)
         sys.stderr.write(
@@ -3790,15 +3827,15 @@ def system_uninstall(args, env=None):
             "  wrapped_names.sh back under %s, in a chain only root\n"
             "  can write, and run the uninstall again. Or, by hand, as root:\n"
             "  `systemctl disable --now %s`, `systemctl stop %s`, remove\n"
-            "  both unit files from %s and `systemctl daemon-reload`, strip\n"
-            "  the block between the walk-blocker markers in each shared hook\n"
-            "  file, remove the fish drop-in outright (the whole file is\n"
-            "  walk-blocker's) -- the hook files are %s -- then remove %s\n"
-            "  and the relink's memory %s.\n"
+            "  both unit files from %s and `systemctl daemon-reload`;\n"
+            "%s"
+            "  then remove %s and the relink's two memories,\n"
+            "  %s and %s.\n"
             % (helper_dir, TIMER_UNIT, SERVICE_UNIT, args.unit_dir,
-               ", ".join(hooks) or "none on this site",
+               hook_steps,
                os.path.join(args.prefix, "bin"),
-               os.path.join(args.spool_dir, UNCOVERED_NAME)))
+               os.path.join(args.spool_dir, UNCOVERED_NAME),
+               os.path.join(args.spool_dir, LINKED_NAME)))
         if granted:
             sys.stderr.write(
                 "  Then remove %s and revoke the journal read it\n"
@@ -3876,6 +3913,13 @@ def system_uninstall(args, env=None):
         return 8
 
     write_not_checked(unknown, before="uninstalling")
+    if args.dry_run:
+        # Issue #109: a dry run removed nothing, and since issue #53 any
+        # account can reach this line, so it must not say otherwise.
+        print("\ndry run: nothing was changed. The commands above would "
+              "uninstall walk-blocker;\nthe audit trail under %s would be "
+              "left in place." % args.spool_dir)
+        return 0
     print("\nremoved. the audit trail under %s is left in place." % args.spool_dir)
     return 0
 

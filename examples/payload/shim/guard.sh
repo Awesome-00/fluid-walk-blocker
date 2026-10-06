@@ -132,7 +132,7 @@ SG_FSTYPES_RE_TRUSTED='^lustre$ ^wekafs$ ^beegfs$ ^gpfs$ ^ceph$ ^nfs4$ ^nfs$ ^ci
 SG_PROXY=1
 SG_MOUNT_OVERRIDES_TRUSTED='/home=expensive=4 /opt/site-tools=cheap'
 SG_MOUNTS_TRUSTED='/proc/mounts'
-SG_VERSION='0.3.1'
+SG_VERSION='0.3.2'
 SG_MAXDEPTH=2
 SG_DEPTH_ALLOWANCE_MAX=8
 SG_UNSCOPED_DEPTH=2
@@ -634,7 +634,16 @@ sg_audit_emit() {
     sg_awk=$SG_AWK
     [ -x "$sg_awk" ] || sg_awk=$(command -v awk 2>/dev/null)
     sg_line=''
+    # `unset POSIXLY_CORRECT` first, inside the substitution so the caller's
+    # shell keeps it. gawk writes ONE backslash for the replacement "\\\\"
+    # whenever that variable is in its environment, even empty, and the
+    # caller sets the environment: a backslash in a root would reach the
+    # record bare and the line would not parse. A `POSIXLY_CORRECT=` prefix
+    # still puts it in the environment, and `env -u` would be a fifth program
+    # on this path; `unset` is a builtin, so the count of four stands
+    # (ADR-0018).
     [ -n "$sg_awk" ] && sg_line=$(
+        unset POSIXLY_CORRECT
         SG_J_TS=$sg_when SG_J_ACTION=$sg_ae_action SG_J_SEAM=$sg_ae_seam \
         SG_J_TOOL=$sg_tool SG_J_ROOT=$sg_ae_root \
         SG_J_MOUNT=$sg_ae_mount SG_J_FS=$sg_ae_fs SG_J_REASON=$sg_ae_reason \
@@ -676,15 +685,46 @@ sg_audit_emit() {
     )
 
     if [ -z "$sg_line" ]; then
-        # No awk anywhere, so there is no safe way to put a caller-controlled
-        # string into JSON. Emit the fields this shim controls -- action and
-        # seam are literals from this file, the tool name is one of the
-        # wrapped names, the fstype comes from the mount table -- and say what
-        # was dropped. Losing the record entirely is the failure this sink
-        # exists to fix, and interpolating raw bytes is the one it just
-        # stopped doing.
-        sg_line=$(printf '{"ts":"%s","layer":"shim","action":"%s","seam":"%s","tool":"%s","fs":"%s","reason":"%s","uid":%s,"note":"caller-controlled fields omitted: no awk to escape them"}' \
-            "$sg_when" "$sg_ae_action" "$sg_ae_seam" "$sg_tool" "$sg_ae_fs" \
+        # No record from awk: none was found, or the one found failed, was
+        # killed or printed nothing. Either way there is no safe way to put
+        # a caller-controlled string into JSON, so the root, mount, paths and
+        # pwd are dropped and the record says so. Losing the record entirely
+        # is the failure this sink exists to fix, and interpolating raw bytes
+        # is the one it just stopped doing.
+        #
+        # What is kept must be representable without escaping. action, seam
+        # and reason are literals from this file. ts is the trusted date's
+        # fixed format and uid was checked above. The tool name is $0's
+        # basename, and any symlink to the shim sets it; the fstype is a
+        # mount-table field, and whoever mounts a FUSE filesystem chooses its
+        # subtype. Those two take sg_report's character check and its bound,
+        # in install.sh: outside the set they become `unrepresentable`, and
+        # past 128 bytes they are cut one character at a time and marked,
+        # as the awk record marks its own cut. No fork: case and parameter
+        # expansion only. An empty fstype stays empty, since the dir seam
+        # judges no mount and the awk record writes "" there too.
+        case $sg_tool in
+            ''|*[!A-Za-z0-9._-]*) sg_fb_tool=unrepresentable ;;
+            *) sg_fb_tool=$sg_tool ;;
+        esac
+        case $sg_ae_fs in
+            *[!A-Za-z0-9._-]*) sg_fb_fs=unrepresentable ;;
+            *) sg_fb_fs=$sg_ae_fs ;;
+        esac
+        sg_fb_cut=''
+        while [ "${#sg_fb_tool}" -gt 128 ]; do
+            sg_fb_tool=${sg_fb_tool%?}
+            sg_fb_cut=',"tool_truncated":true'
+        done
+        sg_fb_tool=$sg_fb_tool'"'$sg_fb_cut
+        sg_fb_cut=''
+        while [ "${#sg_fb_fs}" -gt 128 ]; do
+            sg_fb_fs=${sg_fb_fs%?}
+            sg_fb_cut=',"fs_truncated":true'
+        done
+        sg_fb_fs=$sg_fb_fs'"'$sg_fb_cut
+        sg_line=$(printf '{"ts":"%s","layer":"shim","action":"%s","seam":"%s","tool":"%s,"fs":"%s,"reason":"%s","uid":%s,"note":"caller-controlled fields omitted: no awk record to escape them"}' \
+            "$sg_when" "$sg_ae_action" "$sg_ae_seam" "$sg_fb_tool" "$sg_fb_fs" \
             "$sg_ae_reason" "$sg_uid")
     fi
 
@@ -1738,8 +1778,15 @@ sg_load_mounts() {
         # answer, which is worse than the documented difference between the
         # layers below. The lists arrive through the environment, not `-v`:
         # awk's -v processes escape sequences, and the ERE list carries `\.`.
+        #
+        # LC_ALL=C, as the record's awk has it: the answer must not depend on
+        # the caller's locale. Under a UTF-8 one, gawk's `^[^\/]+:` does not
+        # match a source whose bytes before the colon are not valid UTF-8, so
+        # this reader called such a remote mount cheap while sg_classify,
+        # which matches bytes, called it expensive. An assignment prefix,
+        # so still the one program this path runs (ADR-0018).
         sg_expensive=$(SG_R_RELIST=$SG_FSTYPES_RE SG_R_OVERRIDES=$SG_MOUNT_OVERRIDES \
-            SG_R_PROXY=$SG_PROXY "$SG_AWK" '
+            SG_R_PROXY=$SG_PROXY LC_ALL=C "$SG_AWK" '
             BEGIN {
                 sg_nre = split(ENVIRON["SG_R_RELIST"], sg_re, " ")
                 sg_novr = split(ENVIRON["SG_R_OVERRIDES"], sg_rows, " ")

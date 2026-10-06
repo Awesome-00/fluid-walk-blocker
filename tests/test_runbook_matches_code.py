@@ -69,8 +69,18 @@ def test_every_audit_dir_state_the_reconcile_journals_is_in_the_runbook():
 
 def test_the_runbook_says_coverage_change_is_written_only_when_coverage_shrinks():
     sh = _read(INSTALL_SH)
-    calls = re.findall(r"^(.*)\n\s*sg_report coverage_change", sh, re.M)
-    assert calls == ['    if [ "$((_dropped + SWEPT_N))" -gt 0 ]; then'], calls
+    calls = re.findall(r"^(.*)\n\s*sg_report coverage_change (.*)$", sh, re.M)
+    # The change record, link_farm()'s; then ADR-0031's three: `unknown` when
+    # the memory cannot be read, and on a due poll the standing drift and
+    # the standing `unknown`, each marked. None fires on an addition.
+    assert [(c[0].strip(), c[1]) for c in calls] == [
+        ('if [ "$((_dropped + SWEPT_N))" -gt 0 ]; then',
+         '"unwrapped-$((_dropped + SWEPT_N))"'),
+        ("# so, once now and on the cadence until an install reseeds.", "unknown"),
+        ("# names go to stdout, under the unit, as link_farm()'s do.",
+         '"unwrapped-$_ln_sn" reasserted'),
+        ('if [ "$_ln_origin" = relink ]; then', "unknown reasserted"),
+    ], calls
     clause = _reconcile_bullet().split("`coverage_change`", 1)[1].split("`relink_refused`")[0]
     # The claims themselves, not words a contradicting sentence would share.
     assert clause.startswith(" when coverage shrank "), clause
@@ -127,3 +137,65 @@ def test_the_runbook_says_a_best_effort_hook_is_written_only_when_its_shell_reso
     # drop-in clause must not read as belonging to one class.
     assert "fish, in either class, gets a dedicated `conf.d` drop-in" in hooks
     assert re.search(r"fish\)\n\s*HK_FILE=\$FISH_CONF_FILE; HK_PKG=''; HK_KIND=dropin", sh)
+
+
+def _uncovered_mount_bullet():
+    text = _read(OPERATING)
+    start = text.index("- an **`uncovered_mount`** record")
+    return _joined(text[start:text.index("\n\n", start)])
+
+
+def test_the_runbook_names_the_reassertion_marker_and_its_key():
+    """ADR-0030: a standing uncovered mount is re-asserted, marked, on the
+    cadence `[timer].reassert_interval_s` sets. A reader who sees the
+    marker in the journal and not in the runbook reads a repeat as a
+    change."""
+    sh = _read(INSTALL_SH)
+    calls = re.findall(r"sg_report uncovered_mount \S+ \S+ (\S+)(?: (\S+))?\n", sh)
+    assert ("expensive", "reasserted") in calls, calls
+    assert "@@timer.reassert_interval_s@@" in sh
+    bullet = _uncovered_mount_bullet()
+    assert '`"reasserted": true`' in bullet, bullet
+    assert "`[timer].reassert_interval_s`" in bullet, bullet
+    assert "`covered` and `unmounted` are never re-asserted" in bullet, bullet
+
+
+def test_the_runbook_names_the_drift_reassertion_and_unknown():
+    """ADR-0031: coverage drift is the second standing condition. A reader
+    who meets a marked `coverage_change`, or an `unknown`, in the journal
+    finds both in the runbook's reconcile bullet, with the two meanings of
+    N and the key that sets the cadence."""
+    sh = _read(INSTALL_SH)
+    assert 'sg_report coverage_change "unwrapped-$_ln_sn" reasserted' in sh
+    assert "sg_report coverage_change unknown reasserted" in sh
+    assert "\n        sg_report coverage_change unknown\n" in sh
+    clause = _reconcile_bullet().split("`coverage_change`", 1)[1].split("`relink_refused`")[0]
+    assert "`unwrapped-N` with `\"reasserted\": true`" in clause, clause
+    assert "`[timer].reassert_interval_s`" in clause, clause
+    assert "`coverage_change` `unknown`" in clause, clause
+    assert "until `deploy.py --system` reseeds it" in clause, clause
+    assert "on an unmarked record it counts the links that went on that poll" in clause
+    assert "on a marked one it counts the remembered names still unlinked" in clause
+    assert "A swept name is never re-asserted" in clause, clause
+    assert "`<spool_dir>/linked-names.state`" in clause, clause
+
+
+def test_the_standing_definition_excludes_a_name_unlinked_on_this_poll():
+    """ADR-0031: a name unlinked on this poll gets link_farm()'s change
+    record and is not counted as standing, so the marked N leaves it out.
+    The definition once read "this poll did not link it", which counts it,
+    while the code skips it (review round 1 on the #152 PR). The code's
+    exclusion and both definitions are pinned together."""
+    sh = _read(INSTALL_SH)
+    assert '|| linked_in_list "$_ln_name" "$SG_DROPPED_NAMES"; then' in sh
+    adr = _joined(_read(os.path.join(
+        ROOT, "docs", "adr",
+        "0031-coverage-drift-is-a-standing-condition.md")))
+    assert ("the table still wraps it, and this poll neither linked it nor "
+            "unlinked it.") in adr, adr
+    assert "this poll did not link it" not in adr
+    clause = _joined(
+        _reconcile_bullet().split("`coverage_change`", 1)[1]
+        .split("`relink_refused`")[0])
+    assert ("the remembered names still unlinked, other than any that poll "
+            "unlinked, which get the change record only") in clause, clause

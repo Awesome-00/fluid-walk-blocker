@@ -18,9 +18,10 @@ licence travels in the payload, so a node holds the terms beside the code.
 What stays out of this tree is a customer's operational facts, not the code
 itself -- see "IP hygiene" below, which is unchanged by the licence.
 
-Read `README.md` first, then `docs/adr/0001` through `0029` in order, then
+Read `README.md` first, then `docs/adr/0001` through `0033` in order, then
 `docs/site-config.md` for what a site measures before it can be
-deployed. This file is the part that is easy to get wrong.
+deployed and `docs/node-requirements.md` for what the node must provide.
+This file is the part that is easy to get wrong.
 
 ## Non-negotiables
 
@@ -289,7 +290,7 @@ Commands marked with a milestone do not work yet, or run only as a placeholder
 that says so; they name the shape the tooling will take so the docs do not
 have to be rewritten when it lands.
 
-CI runs the suite on Python 3.9–3.12 in an enterprise-Linux container as a
+CI runs the suite on Python 3.9–3.14 in an enterprise-Linux container as a
 non-root user, so that when the shell and permission tests arrive with the
 node code they see both dash and bash-as-`/bin/sh` and are not vacuous under
 root.
@@ -298,12 +299,14 @@ root.
 
 1. `README.md` — what it is, what is in and out of scope
 2. `docs/plan.md` — the architecture as built, on one page
-3. `docs/adr/0001` … `0029`, in order — the decisions
+3. `docs/adr/0001` … `0033`, in order — the decisions
 4. `docs/site-config.md` — what a site measures before it can be deployed
-5. `docs/operating.md` — the operator's runbook, from `site.toml` to a node
+5. `docs/node-requirements.md` — what the destination node must provide, and
+   the floor below which a fault is unsupported (ADR-0032)
+6. `docs/operating.md` — the operator's runbook, from `site.toml` to a node
    that reports
-6. `docs/alternatives.md` — what to run instead: observed walk patterns and
+7. `docs/alternatives.md` — what to run instead: observed walk patterns and
    their redirects, shipped in every payload beside the site-rendered page
-7. `docs/evidence.md` — where the evidence is, and why it is not here
-8. `CLAUDE.md` — this file: the non-negotiables and the parts that are easy
+8. `docs/evidence.md` — where the evidence is, and why it is not here
+9. `CLAUDE.md` — this file: the non-negotiables and the parts that are easy
    to get wrong

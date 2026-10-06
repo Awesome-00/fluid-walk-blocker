@@ -713,6 +713,90 @@ def test_escape_hatch_degrades_honestly_with_no_awk_to_escape_with(shim_variant,
     assert entry["tool"] == "find"
 
 
+def _failing_awk(tmp_path):
+    awk = tmp_path / "failing-awk"
+    awk.write_text("#!/bin/sh\nexit 1\n")
+    awk.chmod(0o755)
+    return str(awk)
+
+
+@pytest.mark.parametrize("awk", ["absent", "fails"])
+@pytest.mark.parametrize("fstype,expected", [
+    ('fuse.say"what', "unrepresentable"),
+    ("fuse.back\\slash", "unrepresentable"),
+    ("fuse." + "x" * 200, None),
+])
+def test_the_no_awk_record_never_interpolates_a_hostile_fstype(
+        shim_variant, tmp_path, awk, fstype, expected):
+    """The no-awk record runs whenever awk yields no record: none found, or
+    one that fails. A FUSE subtype is chosen by whoever mounted it, so the
+    fstype takes sg_report's character check and its bound, and the record
+    still parses (issue #138)."""
+    mounts = tmp_path / "mounts"
+    mounts.write_text("/dev/sda1 / ext4 rw,relatime 0 0\n"
+                      "srv:/export /scratch %s rw,relatime 0 0\n" % fstype)
+    trusted_awk = "'/nonexistent/awk'" if awk == "absent" else _failing_awk(tmp_path)
+    variant = shim_variant(SG_AWK=trusted_awk,
+                           SG_MOUNTS_TRUSTED="'%s'" % mounts)
+    audit = tmp_path / "audit.jsonl"
+    result = run_shim(variant, ["find", "/scratch", "-name", "x"],
+                      env={R.ESCAPE_HATCH: "1", "WALK_BLOCKER_AUDIT": str(audit)})
+    assert result.returncode == 0, result.stderr.decode()
+    lines = [line for line in audit.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1, lines
+    entry = json.loads(lines[0])
+    assert "no awk" in entry["note"], "the awk record ran, so the fallback was not tested"
+    assert entry["action"] == "escape_hatch"
+    assert entry["reason"] == "at_or_near_root"
+    if expected is None:
+        assert entry["fs"] == fstype[:128]
+        assert entry["fs_truncated"] is True
+    else:
+        assert entry["fs"] == expected
+        assert "fs_truncated" not in entry
+
+
+@pytest.mark.parametrize("hostile,expected", [
+    ('say"what', "unrepresentable"),
+    ("t" * 200, None),
+], ids=["quote", "over-long"])
+def test_the_no_awk_record_never_interpolates_a_hostile_tool_name(
+        shim_variant, tmp_path, hostile, expected):
+    """The tool name is $0's basename, and any symlink to the shim sets it.
+    The dir seam audits a binary resolution for any name, wrapped or not. A
+    name outside the character set is replaced; one past 128 bytes is cut
+    and marked, like the fstype."""
+    variant = shim_variant(SG_AWK="'/nonexistent/awk'")
+    os.symlink(os.path.join(variant["shim_dir"], "find"),
+               os.path.join(variant["shim_dir"], hostile))
+    # The seam names a PATH directory that holds the tool, so resolving with
+    # and without it differs, which is what the dir seam audits.
+    seam_dir = tmp_path / "seam-dir"
+    seam_dir.mkdir()
+    for d in (str(seam_dir), variant["bin_dir"]):
+        stub = os.path.join(d, hostile)
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, 0o755)
+    audit = tmp_path / "audit.jsonl"
+    result = run_shim(variant, [hostile],
+                      env={"WALK_BLOCKER_SHIM_DIR": str(seam_dir),
+                           "WALK_BLOCKER_AUDIT": str(audit),
+                           "PATH": "%s:%s" % (seam_dir, variant["bin_dir"])})
+    assert result.returncode == 0, result.stderr.decode()
+    lines = [line for line in audit.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1, lines
+    entry = json.loads(lines[0])
+    assert entry["seam"] == "WALK_BLOCKER_SHIM_DIR"
+    if expected is None:
+        assert entry["tool"] == hostile[:128]
+        assert entry["tool_truncated"] is True
+    else:
+        assert entry["tool"] == expected
+        assert "tool_truncated" not in entry
+    assert entry["fs"] == ""
+
+
 def test_escape_hatch_says_nothing_when_the_file_sink_is_unwritable(shim_env, tmp_path):
     if os.getuid() == 0:
         pytest.skip("root can write anywhere; the unwritable branch is unreachable")
@@ -784,6 +868,172 @@ def test_both_mount_readers_skip_a_malformed_short_line(shim_variant, tmp_path):
             assert result.returncode == 0, (awk, short, result.stderr.decode())
         result = run_shim(variant, ["find", "/scratch", "-name", "x"], env=env)
         assert result.returncode == R.EXIT_REFUSED, (awk, result.stderr.decode())
+
+
+def _utf8_locale():
+    """A UTF-8 locale this machine has, or None."""
+    try:
+        listed = subprocess.run(["locale", "-a"], capture_output=True,
+                                text=True, errors="replace").stdout.split()
+    except OSError:
+        return None
+    for want in ("en_US.utf8", "en_US.UTF-8", "C.utf8", "C.UTF-8"):
+        if want in listed:
+            return want
+    return next((name for name in listed
+                 if name.lower().endswith((".utf8", ".utf-8"))), None)
+
+
+@pytest.mark.parametrize("shell", ("dash", "bash"))
+@pytest.mark.parametrize("reader", ("awk", "sh"))
+def test_both_mount_readers_judge_a_non_utf8_source_alike_in_a_utf8_locale(
+        shim_variant, rendered_shim, tmp_path, policy, shell, reader):
+    """Issue #162. The reader's awk ran in the caller's locale, and under a
+    UTF-8 one gawk's `^[^/]+:` does not match a source whose bytes before
+    the colon are not valid UTF-8: the awk reader called this remote mount,
+    of a type the site does not list, cheap, and sg_classify, which matches
+    bytes, called it expensive. Both readers, both shells, one answer, and
+    it is the table's. Mutation: drop the reader's `LC_ALL=C` and the awk
+    cases fail."""
+    from conftest import shim_invocation
+
+    locale = _utf8_locale()
+    if locale is None:
+        pytest.skip("no UTF-8 locale is installed, so the caller's locale "
+                    "cannot be made one")
+    real = shutil.which(shell)
+    if real is None:
+        pytest.skip("%s is not installed" % shell)
+    mounts = tmp_path / "mounts"
+    mounts.write_bytes(b"/dev/sda1 / ext4 rw,relatime 0 0\n"
+                       b"\377h:/e /mnt/b xfs rw 0 0\n")
+    # The table's answer, which both readers must give.
+    assert R.classify_mount(("\udcffh:/e", "/mnt/b", "xfs", "rw"), policy) == "expensive"
+
+    awk = _sg_var(rendered_shim["guard_text"], "SG_AWK")
+    if reader == "awk":
+        if not os.access(awk, os.X_OK):
+            pytest.skip("the shim's trusted awk %s is not here" % awk)
+        # Precondition: this awk, in this locale, misses the byte source. One
+        # that matches it anyway cannot show the defect.
+        probe = subprocess.run(
+            [awk, "$1 ~ /^[^\\/]+:/ { print \"match\" }", str(mounts)],
+            capture_output=True, env={"LC_ALL": locale})
+        if b"match" in probe.stdout:
+            pytest.skip("%s matches a non-UTF-8 source under %s, so it cannot "
+                        "show the defect" % (awk, locale))
+        variant = shim_variant()
+    else:
+        variant = shim_variant(SG_AWK="'/nonexistent/awk'")
+
+    as_sh = tmp_path / ("as-sh-" + shell)
+    as_sh.mkdir()
+    os.symlink(real, str(as_sh / "sh"))
+    command, environ, cwd = shim_invocation(
+        variant, ["find", "/mnt/b", "-name", "x"],
+        env={"WALK_BLOCKER_MOUNTS": str(mounts), "LC_ALL": locale})
+    result = subprocess.run([str(as_sh / "sh")] + command, env=environ,
+                            cwd=cwd, capture_output=True)
+    assert result.returncode == R.EXIT_REFUSED, (
+        "the %s reader under %s in %s did not guard the remote mount: %r"
+        % (reader, shell, locale, result.stderr.decode(errors="replace")))
+
+
+# Issue #163. Bytes the kernel leaves unescaped in a mount table, and that
+# are not UTF-8: a source byte before a `host:` colon on a type the policy
+# does not list (remote by the source alone), a mount point byte on a listed
+# type, and a source byte on a local row that has no colon.
+NON_UTF8_TABLE = (b"/dev/sda1 / ext4 rw,relatime 0 0\n"
+                  b"\377h:/e /mnt/b xfs rw 0 0\n"
+                  b"fast /mnt/\377c wekafs rw 0 0\n"
+                  b"local\377 /mnt/d ext4 rw 0 0\n")
+
+
+def test_read_mounts_returns_on_a_non_utf8_table(tmp_path, policy):
+    """A strict decode raised UnicodeDecodeError, which is not the OSError
+    read_mounts catches, so the reaper's poll ended with no record. Each row
+    is decoded as os.fsdecode() decodes a path: an undecodable byte is a lone
+    surrogate, so the mount point compares equal to a cwd os.readlink()
+    returns, and the other fields still classify. Mutation: open the table in
+    text mode and this raises."""
+    mounts = tmp_path / "mounts"
+    mounts.write_bytes(NON_UTF8_TABLE)
+    assert R.read_mounts(str(mounts), policy) == [
+        ("/mnt/\udcffc", "wekafs", "fast", "rw"),
+        ("/mnt/b", "xfs", "\udcffh:/e", "rw"),
+    ]
+    assert os.fsencode("/mnt/\udcffc") == b"/mnt/\377c"
+
+
+@pytest.mark.parametrize("locale", ("C", "utf8"))
+@pytest.mark.parametrize("reader", ("awk", "sh"))
+def test_the_table_and_the_shim_class_a_non_utf8_table_alike(
+        shim_variant, tmp_path, policy, reader, locale):
+    """Issue #163, against issue #162's readers. Every row of the non-UTF-8
+    table gets one answer from read_mounts() and check() and from the shim's
+    awk and sh readers, under the C locale and a UTF-8 one: the byte source
+    of an unlisted type is guarded, the byte mount point of a listed type is
+    guarded, the local row with a byte in its source is not."""
+    if locale == "utf8":
+        locale = _utf8_locale()
+        if locale is None:
+            pytest.skip("no UTF-8 locale is installed")
+    mounts = tmp_path / "mounts"
+    mounts.write_bytes(NON_UTF8_TABLE)
+    table = R.read_mounts(str(mounts), policy)
+    variant = (shim_variant() if reader == "awk"
+               else shim_variant(SG_AWK="'/nonexistent/awk'"))
+    for root, guarded in (("/mnt/b", True), ("/mnt/\udcffc", True),
+                          ("/mnt/d", False)):
+        argv = ["find", root, "-name", "x"]
+        assert (R.check(argv, "/", table, policy) is not None) is guarded, root
+        # subprocess encodes the surrogate back to the byte the table holds.
+        result = run_shim(variant, argv,
+                          env={"WALK_BLOCKER_MOUNTS": str(mounts),
+                               "LC_ALL": locale})
+        assert result.returncode == (R.EXIT_REFUSED if guarded else 0), (
+            root, reader, locale, result.stderr.decode(errors="replace"))
+
+
+# Issue #172. Characters str.split() treats as whitespace and the kernel
+# leaves unescaped, each inside a `host:` source of a type the policy does not
+# list: \v and \f, and U+00A0 and U+0085 as UTF-8.
+ODD_SPACE_TABLE = (b"/dev/sda1 / ext4 rw,relatime 0 0\n"
+                   b"h\x0b:/e /mnt/v xfs rw 0 0\n"
+                   b"h\x0c:/e /mnt/f xfs rw 0 0\n"
+                   b"h\xc2\xa0:/e /mnt/n xfs rw 0 0\n"
+                   b"h\xc2\x85:/e /mnt/x xfs rw 0 0\n")
+
+
+@pytest.mark.parametrize("locale", ("C", "utf8"))
+@pytest.mark.parametrize("reader", ("awk", "sh"))
+def test_the_table_splits_mount_fields_as_the_shim_does(
+        shim_variant, tmp_path, policy, reader, locale):
+    """Issue #172. The shim's readers split a mount line on space and tab
+    only; read_mounts() used str.split(), which also splits on \\v, \\f,
+    U+00A0, U+0085 and more. A source holding one of them read as two
+    fields, every later field shifted, and the remote mount the shim refuses
+    was not in the reaper's table at all. Mutation: put str.split() back and
+    the table loses every row."""
+    if locale == "utf8":
+        locale = _utf8_locale()
+        if locale is None:
+            pytest.skip("no UTF-8 locale is installed")
+    mounts = tmp_path / "mounts"
+    mounts.write_bytes(ODD_SPACE_TABLE)
+    table = R.read_mounts(str(mounts), policy)
+    assert sorted(row[0] for row in table) == [
+        "/mnt/f", "/mnt/n", "/mnt/v", "/mnt/x"], table
+    variant = (shim_variant() if reader == "awk"
+               else shim_variant(SG_AWK="'/nonexistent/awk'"))
+    for root in ("/mnt/v", "/mnt/f", "/mnt/n", "/mnt/x"):
+        argv = ["find", root, "-name", "x"]
+        assert R.check(argv, "/", table, policy) is not None, root
+        result = run_shim(variant, argv,
+                          env={"WALK_BLOCKER_MOUNTS": str(mounts),
+                               "LC_ALL": locale})
+        assert result.returncode == R.EXIT_REFUSED, (
+            root, reader, locale, result.stderr.decode(errors="replace"))
 
 
 def test_the_shim_ignores_a_whitespace_escaped_mount_and_the_table_does_not(

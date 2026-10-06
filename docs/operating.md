@@ -30,18 +30,22 @@ On the node you deploy to:
   table (ADR-0002).
 - Python 3.9 or later, stdlib only. Nothing under `node/` imports a
   third-party package, and there is no `uv` on the node (ADR-0015).
-- A POSIX `sh` that is dash-clean. The shim, `install.sh`, `walk-job` and
-  `measure.sh` all run under `[trusted_binaries].sh`.
+- A POSIX `sh` that is dash-clean. `deploy.py` and the timer's service run
+  `install.sh` under `[trusted_binaries].sh`; the shim, `walk-job` and the
+  measurement scripts run under their own `#!/bin/sh`.
 - The Slurm client (`sbatch`) reachable at `[slurm].sbatch_glob`, for
   `walk-job`. The scheduler is what enforces the wall-clock bound the
   refusal text offers (ADR-0007).
 - A `logger` at `[trusted_binaries].logger` that accepts `--size`. Every
   Layer 1 record is sent with it, and a logger that rejects the option
-  drops the record silently. util-linux `logger` has it: present in 2.32.1
-  and 2.37.4 as measured; the util-linux man pages put its arrival at 2.27,
-  not measured. BusyBox `logger` does not have it.
+  drops the record silently. util-linux `logger` has it from 2.27, by its
+  man pages; BusyBox `logger` does not have it.
 - Root, held by the person running the install. Nothing here escalates;
   `deploy.py` checks `os.geteuid()` and refuses otherwise (ADR-0004).
+
+The full list, one row per dependency with the feature relied on, is
+`docs/node-requirements.md`. A fault that occurs only below a row there is
+unsupported (ADR-0032).
 
 ## 2. Write `site.toml`
 
@@ -347,7 +351,9 @@ account (ADR-0004):
   carries `.walk-blocker-spool`, the root-owned marker that the relink and the
   reaper require before they write into it as root. The relink
   keeps `uncovered-mounts.state` there too, its memory of which mounts it has
-  reported (ADR-0019);
+  reported (ADR-0019), and `linked-names.state`, its memory of which wrapped
+  names have been linked since the install, which the install seeds
+  (ADR-0031);
 - a hook block in each `required` shell's startup file named by
   `[hooks.<shell>].file` — above the interactivity guard in the bash rc,
   since a non-interactive shell returns before reaching anything below it —
@@ -388,7 +394,9 @@ What it verifies, and refuses on:
   the timer disabled and says so. When more than one step fails, the exit
   status is the most severe and the rest are reported on stderr only: a
   hook-proof failure (4) outranks a journal step that did not land (10, or a
-  command's own status);
+  command's own status). `install.sh` runs while the timer is disabled, so
+  its output carries a line saying the timer is not armed; that is the
+  state at that moment, and the deploy enables the timer after it (§14);
 - **ownership.** Everything under the prefix is reasserted `root:root` with
   group and other write stripped, and the unit is not written if anything
   under the prefix still fails that test;
@@ -484,9 +492,9 @@ required hook that failed its proof (4), because the install carries on to
 re-arm Layer 2. If the ownership check after `install.sh` then refuses, the
 status is 9, as above, and the timer stays disabled. If `systemctl
 daemon-reload` or `enable --now` then fails, the status is that command's
-own, and the run ends before `deploy.py` prints its Layer-1-not-proven
-notice: `install.sh`'s own stderr is then the only report of the hook
-failure (issue #145). If the journal step then fails, the status is 4. Under
+own, not 4, because 4 promises that Layer 2 is running and here it is not
+known to be; `deploy.py` says on stderr that neither layer can be relied on
+(issue #145). If the journal step then fails, the status is 4. Under
 `--verify`, drift and an unreadable file together exit 1. The install's dry
 run can report two refusals, from its checks and from the payload check, but
 both are 6. Order, not severity, decides between the uninstall's 5 and 7:
@@ -626,7 +634,24 @@ It carries three kinds of record:
   `coverage_change` when coverage shrank — a name was unwrapped, or a shim
   the name list no longer claims was swept — with the count, never the
   names; a name that starts being wrapped writes no record, so this is the
-  only signal of a removal and its absence after an addition is normal;
+  only signal of a removal and its absence after an addition is normal.
+  The drift is then a standing condition (ADR-0031): once per
+  `[timer].reassert_interval_s`, while any name linked since the install is
+  still not linked, the relink writes one `coverage_change` `unwrapped-N`
+  with `"reasserted": true` and prints the names. N means two things: on an
+  unmarked record it counts the links that went on that poll, swept ones
+  included; on a marked one it counts the remembered names still unlinked,
+  other than any that poll unlinked, which get the change record only.
+  A swept name is never re-asserted, and a tool absent at the install is
+  never drift. When the relink cannot read its memory,
+  `<spool_dir>/linked-names.state` — absent, damaged, or a link — it
+  reseeds it from that poll and writes `coverage_change` `unknown`, then
+  re-asserts `unknown`, marked, on the same cadence until
+  `deploy.py --system` reseeds it: drift before that poll is not known.
+  `unwrapped-N` is at warning priority and `unknown` at error priority,
+  re-assertions included, so `journalctl -t walk-blocker -p err` isolates a
+  relink that cannot judge drift (ADR-0033).
+  Without a pinned spool no drift is reported at all;
   `relink_refused` when the relink stopped at one of its own checks;
 - one **`refused`** record per refusal, from the shim itself, carrying the
   tool, the root it was asked to walk, the mount and type that judged it,
@@ -645,7 +670,13 @@ It carries three kinds of record:
   a mount in the live table is seen running on its compiled default with no
   `[[filesystems.mounts]]` override, `covered` once an override or a
   narrower default has taken it over, `unmounted` once it has left the
-  table. A steady state is silent. The `expensive` line is the visible cost
+  table. Between changes, a mount that is still uncovered is reported again,
+  once per `[timer].reassert_interval_s` (rounded up to the next poll), as
+  the same `expensive` record with `"reasserted": true` (ADR-0030), so a
+  journal that has rotated the first line away still says the condition
+  holds. A record without `reasserted` is a change; `covered` and
+  `unmounted` are never re-asserted, and a node with nothing uncovered
+  writes nothing on the cadence. The `expensive` line is the visible cost
   of not having surveyed: read the mount and the type, run the survey, and
   either add an override — the next poll answers with `covered` — or keep
   the survey output beside `site.toml` as the record that the default was
@@ -669,7 +700,14 @@ shown as `?`, as it always was.
 
 **What an empty journal means.** Quiet is healthy: nothing was refused, no
 override was used, every hook block is present and fires, the audit
-directory has the right mode, and no expensive mount is running uncovered.
+directory has the right mode, no expensive mount is running uncovered, and
+every name linked since the install is still linked. Those last two clauses
+hold only over a window at least as long as `[timer].reassert_interval_s`:
+a standing uncovered mount (ADR-0030) and standing coverage drift
+(ADR-0031) are re-asserted on that cadence, so quiet over a shorter window
+means only that nothing changed in it, not that nothing is uncovered or
+unlinked. Read `<spool_dir>/uncovered-mounts.state` and
+`<spool_dir>/linked-names.state` for the current sets.
 **What it does not mean** is that no unbounded walk ran. Every Layer 1
 bypass — an absolute path, a private `PATH`, a container, a batch script, a
 shell function, a second-level shell, a session that started before the
@@ -715,7 +753,13 @@ Three consequences, and none of them is visible from the trail alone:
   every active user has their own file, and `SystemMaxFiles` (default 100)
   caps the archived files for all of them together. On a login node with
   many users that can be less than a day. A `proven-quiet` Layer 1 then
-  means quiet within that window, not since install. Measure it:
+  means quiet within that window, not since install. The two standing
+  conditions, an `uncovered_mount` (ADR-0030) and coverage drift as
+  `coverage_change` (ADR-0031), are re-asserted every
+  `[timer].reassert_interval_s` so they survive that rotation; set the
+  interval to at most half the shortest window measured here
+  (`docs/site-config.md`). Other change records and refusals are not
+  re-asserted. Measure it:
 
 ```sh
 systemd-analyze cat-config systemd/journald.conf | grep -E 'SplitMode|SystemMax|MaxRetention'
@@ -731,7 +775,7 @@ ADR-0026's exposure, not only to disk use.
 
 ## 11. Ask the node what is deployed
 
-Four answers, and they should agree:
+Five answers, and they should agree:
 
 ```sh
 cat <prefix>/.walk-blocker-payload
@@ -937,8 +981,9 @@ their unit files; removes the journal drop-in under
 `[install].tmpfiles_dir` and revokes, under each journal directory that
 exists, the read it granted to the gids it records (ADR-0026); strips every hook block
 and removes the fish drop-in whether or not that shell still resolves
-(ADR-0008); and removes `<prefix>/bin` and the uncovered-mounts memory in
-the spool. It does not remove the prefix: the payload stays under it. The
+(ADR-0008); and removes `<prefix>/bin` and the relink's two memories in
+the spool, `uncovered-mounts.state` and `linked-names.state`. It does not
+remove the prefix: the payload stays under it. The
 `<file>.walk-blocker.orig` backups and the audit trail under
 `[install].spool_dir` are records; read its output for what it left, and
 copy the trail somewhere before removing it if the evidence is still
@@ -955,12 +1000,17 @@ refuses with exit 3, having stripped nothing, unless systemd then reports
 both units inactive and the timer not enabled. The one timer drives the
 relink and the reaper both, so this stops Layer 2 too, and the output says
 so. It then strips every hook block, removes the fish drop-in, and removes
-`<prefix>/bin` and the uncovered-mounts memory in the spool. It leaves in
+`<prefix>/bin` and the relink's two memories in the spool. It leaves in
 place the payload under the prefix, the disabled unit files, the journal
 drop-in and the grant it records, the `<file>.walk-blocker.orig` backups,
-and the spool with its audit trail. To restore both layers, run
-`python3 deploy.py --system` from a payload; to finish the teardown, run
-`python3 deploy.py --uninstall` from the payload, as above. Never re-arm
+and the spool with its audit trail. The only restore is
+`python3 deploy.py --system` from a payload, which puts back both layers;
+to finish the teardown instead, run `python3 deploy.py --uninstall` from
+the payload, as above. `sh <prefix>/shim/install.sh --system` is not a
+restore: it rewrites Layer 1 and leaves the timer as it found it,
+disabled, so Layer 2 and the relink stay off. It says so: a writing
+`install.sh --system` prints one line naming the timer's state unless it
+reads active and enabled, and a state it cannot read is said too. Never re-arm
 the timer with `systemctl enable` by hand: its first poll runs a relink over
 the removed hooks, which rebuilds `<prefix>/bin` and reports each missing
 block as damage (ADR-0008).

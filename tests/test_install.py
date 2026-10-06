@@ -11,6 +11,7 @@ audit sink is neutralized in both of its forms.
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1970,6 +1971,36 @@ def test_the_uninstall_removes_the_memory_and_keeps_the_spool(tmp_path):
     assert "left in place" in result.stdout
 
 
+@pytest.mark.parametrize("mode", ["--system", "--uninstall"])
+@pytest.mark.parametrize("planted", ["files", "links"])
+def test_install_and_uninstall_remove_both_memory_names_never_through_a_link(
+        tmp_path, mode, planted):
+    """The memory and its write-and-rename file both go, from the pinned
+    spool, at an install and at an uninstall: a relink that stops between
+    the create and the rename leaves the `.new` behind, and it is the
+    installer's to take. A link at either name is removed and its target
+    left alone. Mutation: drop the `.new` from either `rm -f`, and the
+    matching case fails."""
+    layout = _stateful_layout(tmp_path)
+    H.stage_spool(layout)
+    if mode == "--uninstall":
+        layout.bin.mkdir(parents=True)
+    sentinel = _sentinel(tmp_path)
+    before = _sentinel_state(sentinel)
+    for name in (STATE_NAME, STATE_NAME + ".new"):
+        path = layout.spool / name
+        if planted == "links":
+            os.symlink(str(sentinel), str(path))
+        else:
+            path.write_text("boot x\n/archive nfs4\n")
+    result, layout = run_install(tmp_path, [mode], fake_uid=0, layout=layout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in (STATE_NAME, STATE_NAME + ".new"):
+        assert not os.path.lexists(str(layout.spool / name)), name
+    assert _sentinel_state(sentinel) == before
+    assert layout.spool.is_dir()
+
+
 def test_the_memory_is_readable_like_the_spool_whatever_the_umask(tmp_path):
     """ADR-0019 says the memory is readable like the rest of the spool, which
     is 0640 for the reader group (ADR-0025); a root relink under a 077 umask
@@ -1984,6 +2015,314 @@ def test_the_memory_is_readable_like_the_spool_whatever_the_umask(tmp_path):
     assert result.returncode == 0, result.stderr
     mode = stat.S_IMODE((layout.spool / STATE_NAME).stat().st_mode)
     assert mode == 0o640, oct(mode)
+
+
+# --------------------------------------------------------------------------
+# a standing condition is re-asserted on a slow cadence (ADR-0030)
+# --------------------------------------------------------------------------
+
+REASSERT = H.REASSERT_INTERVAL_S
+SHELLS = ["dash", "bash"]
+
+# A table with a second uncovered remote mount beside `/archive`.
+TWO_UNCOVERED = FIXTURE_MOUNTS + "nas:/new /mnt/new nfs4 rw 0 0\n"
+# A table with nothing uncovered at all: only the covered and cheap rows.
+NOTHING_UNCOVERED = "".join(line + "\n" for line in FIXTURE_MOUNTS.splitlines()
+                            if " /archive " not in line)
+
+
+def _uptime():
+    """The integer part of /proc/uptime, as install.sh reads it."""
+    with open("/proc/uptime") as fh:
+        return int(fh.read().split()[0].split(".")[0])
+
+
+def _boot_id():
+    with open("/proc/sys/kernel/random/boot_id") as fh:
+        return fh.read().strip()
+
+
+def _marked(records):
+    """Every uncovered_mount record as (mount, fstype, state, reasserted),
+    sorted, with `reasserted` None where the key is absent -- so a change
+    record that grew a `"reasserted": false` would not pass for unmarked."""
+    return sorted((r["mount"], r["fstype"], r["state"], r.get("reasserted"))
+                  for r in records if r["action"] == "uncovered_mount")
+
+
+def _state_lines(layout):
+    return (layout.spool / STATE_NAME).read_text().splitlines()
+
+
+def _set_asserted_line(layout, line):
+    """Replace the memory's second line, or drop it when `line` is None
+    (the v0.3.1 format, which had no clock)."""
+    lines = _state_lines(layout)
+    assert lines[1].startswith("asserted "), lines
+    if line is None:
+        del lines[1]
+    else:
+        lines[1] = line
+    (layout.spool / STATE_NAME).write_text("\n".join(lines) + "\n")
+
+
+def _asserted(layout):
+    lines = _state_lines(layout)
+    assert lines[0].startswith("boot "), lines
+    word, _sep, value = lines[1].partition(" ")
+    assert word == "asserted", lines
+    return int(value)
+
+
+def _relink(tmp_path, layout, shell=None):
+    result, records = relink_with_a_recording_logger(
+        tmp_path, layout, shell=shutil.which(shell) if shell else None)
+    assert result.returncode == 0, result.stderr
+    return records
+
+
+def _need(shell):
+    if not shutil.which(shell):
+        pytest.skip("%s is not installed" % shell)
+
+
+def test_the_memory_carries_the_clock_on_its_second_line(tmp_path):
+    """`asserted N` is line 2, not a third field on the boot line, and it is
+    stamped on the first poll with a value no earlier than the uptime read
+    before that poll."""
+    layout = _stateful_layout(tmp_path)
+    before = _uptime()
+    _relink(tmp_path, layout)
+    lines = _state_lines(layout)
+    assert lines[0].split() == ["boot", _boot_id()], lines
+    assert _asserted(layout) >= before
+    assert lines[2:] == ["/archive nfs4"], lines
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_standing_mount_is_not_reasserted_before_the_cadence(tmp_path, shell):
+    """THE ORACLE, not yet due: two minutes (or a quarter of a short
+    interval) short of it, the steady state is still silent. Mutation:
+    re-assert on every poll, and this fails."""
+    _need(shell)
+    layout = _stateful_layout(tmp_path)
+    _relink(tmp_path, layout, shell)
+    stamp = _uptime() - (REASSERT - min(120, REASSERT // 4))
+    _set_asserted_line(layout, "asserted %d" % stamp)
+    records = _relink(tmp_path, layout, shell)
+    assert _marked(records) == [], records
+    assert _asserted(layout) == stamp, "a poll that is not due carries the clock"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_standing_mount_is_reasserted_once_the_cadence_passes(tmp_path, shell):
+    """THE ORACLE, due: one second past the interval, every standing mount
+    is reported once more -- the same action and state, notice priority,
+    marked `reasserted` -- and the next poll is silent again because the
+    clock moved. Mutation: never re-assert, and this fails."""
+    _need(shell)
+    layout = _stateful_layout(tmp_path)
+    layout.mount_table.write_text(TWO_UNCOVERED)
+    _relink(tmp_path, layout, shell)
+    standing = sorted(tuple(line.split()) for line in _state_lines(layout)[2:])
+    assert standing == [("/archive", "nfs4"), ("/mnt/new", "nfs4")], standing
+    _set_asserted_line(layout, "asserted %d" % (_uptime() - (REASSERT + 1)))
+    before = _uptime()
+    log = layout.tmp_path / "logger-calls.txt"
+    calls = len(log.read_text().splitlines())
+    records = _relink(tmp_path, layout, shell)
+    assert _marked(records) == [(m, f, "expensive", True) for m, f in standing], records
+    new_calls = log.read_text().splitlines()[calls:]
+    marked_calls = [c for c in new_calls if '"reasserted":true' in c]
+    assert len(marked_calls) == len(standing), new_calls
+    assert all(" -p user.notice " in c for c in marked_calls), marked_calls
+    assert _asserted(layout) >= before
+    records = _relink(tmp_path, layout, shell)
+    assert _marked(records) == [], "the clock did not move: %s" % records
+
+
+def test_a_new_mount_on_a_due_poll_is_a_change_not_a_reassertion(tmp_path):
+    """The poll the cadence falls due on is also the poll a new mount
+    appears: the new one gets the change record only, the standing one the
+    re-assertion only, and neither is said twice."""
+    layout = _stateful_layout(tmp_path)
+    _relink(tmp_path, layout)
+    _set_asserted_line(layout, "asserted %d" % (_uptime() - (REASSERT + 1)))
+    layout.mount_table.write_text(TWO_UNCOVERED)
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [("/archive", "nfs4", "expensive", True),
+                                ("/mnt/new", "nfs4", "expensive", None)], records
+
+
+def test_covered_and_unmounted_are_never_reasserted(tmp_path):
+    """`covered` and `unmounted` answer an earlier line once; they are
+    events, not standing conditions, and a due poll does not mark them."""
+    layout = _stateful_layout(tmp_path)
+    layout.mount_table.write_text(TWO_UNCOVERED)
+    _relink(tmp_path, layout)
+    _set_asserted_line(layout, "asserted %d" % (_uptime() - (REASSERT + 1)))
+    layout.mount_table.write_text(FIXTURE_MOUNTS)       # /mnt/new is gone
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [("/archive", "nfs4", "expensive", True),
+                                ("/mnt/new", "nfs4", "unmounted", None)], records
+
+    _set_asserted_line(layout, "asserted %d" % (_uptime() - (REASSERT + 1)))
+    covered = H.make_policy(mounts=dict(FIXTURE_POLICY.mounts, **{"/archive": ("expensive", 3)}))
+    layout2 = Layout(tmp_path / "covered", spool=layout.spool, mount_table=layout.mount_table)
+    stamped_install(tmp_path, dest=layout2.tmp_path / "copy", layout=layout2, policy=covered,
+                    **{"derived.mount_overrides": H.render_shim_module.mount_overrides(covered)})
+    result, records = relink_with_a_recording_logger(tmp_path, layout2, script=layout2.script)
+    assert result.returncode == 0, result.stderr
+    assert _marked(records) == [("/archive", "nfs4", "covered", None)], records
+
+
+def test_an_empty_set_on_a_due_poll_says_nothing_and_moves_the_clock(tmp_path):
+    """Nothing is standing, so nothing is re-asserted: no heartbeat record
+    (ADR-0008, healthy is silent). The clock still advances."""
+    layout = _stateful_layout(tmp_path, )
+    layout.mount_table.write_text(NOTHING_UNCOVERED)
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [], records
+    _set_asserted_line(layout, "asserted %d" % (_uptime() - (REASSERT + 1)))
+    before = _uptime()
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [], records
+    assert [r for r in records if r.get("reasserted")] == [], records
+    assert _asserted(layout) >= before
+    assert _state_lines(layout)[2:] == []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("line", [
+    None,                       # a v0.3.1 memory: no clock line at all
+    "asserted notanumber",
+    "asserted ",
+    "asserted",
+    "asserted 0089",            # a leading zero: octal to $(( )), fatal in dash
+    "asserted " + "9" * 23,     # past what the shell's arithmetic holds
+    "FUTURE",
+], ids=["v0.3.1", "not-a-number", "empty", "no-value", "leading-zero",
+        "overflow", "future"])
+def test_an_unreadable_clock_reasserts_and_never_suppresses(tmp_path, shell, line):
+    """A clock the relink cannot read is due, never "recently said". A parse
+    failure that suppressed the line would be silence passing for health.
+    Mutation: treat a parse failure as not due, and this fails."""
+    _need(shell)
+    layout = _stateful_layout(tmp_path)
+    _relink(tmp_path, layout, shell)
+    if line == "FUTURE":
+        line = "asserted %d" % (_uptime() + 10 * REASSERT)
+    _set_asserted_line(layout, line)
+    before = _uptime()
+    records = _relink(tmp_path, layout, shell)
+    assert _marked(records) == [("/archive", "nfs4", "expensive", True)], records
+    assert _asserted(layout) >= before
+    assert _marked(_relink(tmp_path, layout, shell)) == []
+
+
+def test_no_state_is_fresh_unmarked_then_silent(tmp_path):
+    layout = _stateful_layout(tmp_path)
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [("/archive", "nfs4", "expensive", None)], records
+    assert _marked(_relink(tmp_path, layout)) == []
+
+
+@pytest.mark.parametrize("age", [REASSERT + 1, 60], ids=["overdue", "recent"])
+def test_an_earlier_boot_is_fresh_unmarked_then_silent(tmp_path, age):
+    """A clock under another boot's line is no clock, overdue or not: the
+    set is asserted afresh, unmarked, and the clock restarts at this boot's
+    uptime rather than carrying the other boot's value forward."""
+    layout = _stateful_layout(tmp_path)
+    _relink(tmp_path, layout)
+    _set_asserted_line(layout, "asserted %d" % max(0, _uptime() - age))
+    lines = _state_lines(layout)
+    lines[0] = "boot an-earlier-boot"
+    (layout.spool / STATE_NAME).write_text("\n".join(lines) + "\n")
+    before = _uptime()
+    records = _relink(tmp_path, layout)
+    assert _marked(records) == [("/archive", "nfs4", "expensive", None)], records
+    assert _asserted(layout) >= before
+    assert _marked(_relink(tmp_path, layout)) == []
+
+
+def test_after_an_install_the_first_poll_is_fresh_unmarked_then_silent(tmp_path):
+    """The install removes the memory, overdue clock and all; the first root
+    relink after it is a fresh assertion, not a re-assertion."""
+    layout = _stateful_layout(tmp_path)
+    (layout.spool / STATE_NAME).write_text(
+        "boot %s\nasserted 1\n/archive nfs4\n" % _boot_id())
+    installed, layout = run_install(tmp_path, ["--system"], fake_uid=0, layout=layout)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert not (layout.spool / STATE_NAME).exists()
+    for want in ([("/archive", "nfs4", "expensive", None)], []):
+        result, records = relink_with_a_recording_logger(
+            tmp_path, layout, fake_uid=0, script=layout.script)
+        assert result.returncode == 0, result.stderr
+        assert _marked(records) == want, records
+
+
+def test_without_a_writable_spool_every_poll_is_unmarked(tmp_path):
+    """No memory means no clock: the whole set on every poll, as ADR-0019
+    has it, and never a `reasserted` line, which would claim a memory the
+    relink does not have."""
+    layout = Layout(tmp_path)
+    assert not layout.spool.exists()
+    for _ in range(3):
+        records = _relink(tmp_path, layout)
+        assert _marked(records) == [("/archive", "nfs4", "expensive", None)], records
+    assert not layout.spool.exists()
+
+
+def _drive_sg_report(tmp_path, *args, **kw):
+    """Run install.sh's sg_report alone, with the constants it reads, and
+    return the one record it logged as (priority, json). `shell=` names the
+    shell to drive it with; the default is the harness's."""
+    layout = stamped_install(tmp_path, dest=tmp_path / "sg-report-copy")
+    text = layout.script.read_text()
+    consts = [line for line in text.splitlines()
+              if line.split("=", 1)[0] in ("SG_LOGGER", "SG_LOG_SIZE",
+                                            "SG_REPORT_MOUNT_MAX",
+                                            "SG_REPORT_FSTYPE_MAX")]
+    assert len(consts) == 4, consts
+    body = re.search(r"^sg_report\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+    driver = tmp_path / "drive.sh"
+    # `set -eu` as install.sh has it (its line near the top), so a path that
+    # reads an unset variable aborts here as it would on the node.
+    driver.write_text("set -eu\n" + "\n".join(consts) + "\n" + body + 'sg_report "$@"\n')
+    bin_dir = tmp_path / "sg-report-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "sg-report-calls.txt"
+    write_stub(bin_dir / TEST_LOGGER, H.recording_logger_stub(log))
+    driver.write_text(driver.read_text().replace("command -v logger",
+                                                 "command -v %s" % TEST_LOGGER))
+    shell = shutil.which(kw["shell"]) if kw.get("shell") else SH
+    result = subprocess.run([shell, str(driver)] + list(args), capture_output=True,
+                            text=True, timeout=30, env={"PATH": str(bin_dir)})
+    assert result.returncode == 0, result.stderr
+    calls = log.read_text().splitlines()
+    assert len(calls) == 1, calls
+    prio = calls[0].split(" -p ", 1)[1].split()[0]
+    return prio, json.loads(calls[0].split("-- ", 1)[1])
+
+
+def test_sg_report_marks_a_reassertion_and_nothing_else(tmp_path):
+    prio, record = _drive_sg_report(tmp_path, "uncovered_mount", "/archive",
+                                    "nfs4", "expensive", "reasserted")
+    assert prio == "user.notice"
+    assert record == {"layer": "shim", "action": "uncovered_mount",
+                      "state": "expensive", "mount": "/archive",
+                      "fstype": "nfs4", "reasserted": True}
+    _prio, record = _drive_sg_report(tmp_path / "plain", "uncovered_mount",
+                                     "/archive", "nfs4", "expensive")
+    assert "reasserted" not in record, record
+
+
+@pytest.mark.parametrize("fifth", ["true", "Reasserted", "", "reasserted "])
+def test_sg_report_refuses_any_other_fifth_argument(tmp_path, fifth):
+    _prio, record = _drive_sg_report(tmp_path, "uncovered_mount", "/archive",
+                                     "nfs4", "expensive", fifth)
+    assert record == {"layer": "shim", "action": "caller-bug",
+                      "state": "caller-bug"}, record
 
 
 # --------------------------------------------------------------------------
@@ -2105,6 +2444,7 @@ def _swap_in_a_trap(layout, sentinel, marker=True):
         # layer down, no write following a link, is what this test proves.
         H.stage_spool(layout)
     for name in (H.AUDIT_FILENAME, STATE_NAME, STATE_NAME + ".new",
+                 "linked-names.state", "linked-names.state.new",
                  "reaper-audit.jsonl", "reaper-state.json",
                  "reaper-state.json.tmp"):
         os.symlink(str(sentinel), str(layout.spool / name))
@@ -2124,6 +2464,8 @@ def test_the_relink_writes_no_link_planted_in_a_swapped_spool(tmp_path):
     assert result.returncode == 0, result.stderr
     assert _sentinel_state(sentinel) == before
     assert not (layout.spool / STATE_NAME).is_symlink(), "the memory went through the link"
+    assert not (layout.spool / "linked-names.state").is_symlink(), (
+        "the linked-set memory went through the link")
 
 
 def test_a_spool_that_is_a_link_to_a_directory_leaves_the_target_alone(tmp_path):
@@ -2210,8 +2552,17 @@ def _hooked_layout(tmp_path, **state):
     result, layout = run_install(tmp_path, ["--system"], fake_uid=0, layout=layout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert BEGIN in layout.bashrc.read_text()
-    assert H.systemctl_calls(layout.toolbin) == [], "the install touched the units"
+    # The install READS the timer's state to say whether it is armed (issue
+    # #105) and changes nothing. Its reads are cleared from the log, so a
+    # test of what the uninstall then calls sees the uninstall's calls only.
+    calls = [argv for argv, _block in H.systemctl_calls(layout.toolbin)]
+    assert set(calls) <= TIMER_READS, "the install touched the units: %r" % calls
+    H.systemctl_paths(layout.toolbin)[1].unlink()
     return layout
+
+
+TIMER_READS = {"is-active walk-blocker.timer",
+               "show walk-blocker.timer --property=UnitFileState --value"}
 
 
 ARMED = {"TIMER_FILE": "enabled", "TIMER_ACTIVE": "active",
@@ -2374,3 +2725,714 @@ def test_the_state_words_agree_with_deploy_py(tmp_path, monkeypatch, timer_word,
                                  script=layout.script, systemctl_body=body)
     assert result.returncode == (0 if down else 3), result.stdout + result.stderr
     assert layout.bin.exists() is not down
+
+
+# --------------------------------------------------------------------------
+# coverage drift is a standing condition, remembered as a high-water linked
+# set (ADR-0031)
+# --------------------------------------------------------------------------
+
+LINKED = "linked-names.state"
+ALL_TOOLS = ("find", "grep", "du")
+TWO_TOOLS = ("find", "grep")
+
+
+def _sh(shell):
+    _need(shell)
+    return shutil.which(shell)
+
+
+def _drift_install(tmp_path, shell, tools=ALL_TOOLS, layout=None):
+    """A root --system install, which seeds the memory with what it linked."""
+    result, layout = run_install(tmp_path, ["--system"], fake_uid=0, tools=tools,
+                                 layout=layout, shell=_sh(shell))
+    assert result.returncode == 0, result.stdout + result.stderr
+    return layout
+
+
+def _drift_relink(tmp_path, layout, shell, tools=ALL_TOOLS):
+    """A root relink from the deployed copy, as the unit runs it. Returns
+    `(stdout, [(state, reasserted)])` for every coverage_change record, with
+    `reasserted` None where the key is absent."""
+    result, records = relink_with_a_recording_logger(
+        tmp_path, layout, tools=tools, fake_uid=0, script=layout.script,
+        shell=_sh(shell))
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout, _drift(records)
+
+
+def _drift(records):
+    return [(r["state"], r.get("reasserted"))
+            for r in records if r["action"] == "coverage_change"]
+
+
+def _memory(layout):
+    return (layout.spool / LINKED).read_text().splitlines()
+
+
+def _memory_names(layout):
+    return _memory(layout)[3:]
+
+
+def _set_memory_line(layout, index, line):
+    lines = _memory(layout)
+    lines[index] = line
+    (layout.spool / LINKED).write_text("\n".join(lines) + "\n")
+
+
+def _make_due(layout):
+    _set_memory_line(layout, 1, "asserted %d" % (_uptime() - (REASSERT + 1)))
+
+
+def _make_recent(layout):
+    # Elapsed zero: the whole interval is margin, however short a freshly
+    # booted runner makes it.
+    _set_memory_line(layout, 1, "asserted %d" % _uptime())
+
+
+def _memory_asserted(layout):
+    word, _sep, value = _memory(layout)[1].partition(" ")
+    assert word == "asserted", _memory(layout)
+    return int(value)
+
+
+def _du_standing(tmp_path, shell):
+    """An install that linked find, grep and du; then a relink on which du
+    has gone, which writes the change record. du is now standing."""
+    layout = _drift_install(tmp_path, shell)
+    assert _memory(layout)[2:] == ["seeded system", "find", "grep", "du"]
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", None)], drift
+    assert "du" in _memory_names(layout)
+    return layout
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_install_seeds_the_memory_with_what_it_linked(tmp_path, shell):
+    """Line by line: this boot, the clock, `seeded system`, then the table
+    names this install linked, in table order -- never walk-job."""
+    before = _uptime()
+    layout = _drift_install(tmp_path, shell)
+    lines = _memory(layout)
+    assert lines[0].split() == ["boot", _boot_id()], lines
+    assert _memory_asserted(layout) >= before
+    assert lines[2:] == ["seeded system", "find", "grep", "du"], lines
+    assert "walk-job" not in lines
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_standing_name_is_reasserted_once_the_cadence_passes(tmp_path, shell):
+    """THE ORACLE, due (1). du was linked at the install and is not linked
+    now: one `coverage_change unwrapped-1`, marked, and the name on stdout.
+    Mutation: drop the re-assertion, and this fails."""
+    layout = _du_standing(tmp_path, shell)
+    _make_due(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", True)], drift
+    assert "walk-blocker: linked since the last install, not linked now: du\n" in out, out
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_standing_name_is_not_reasserted_before_the_cadence(tmp_path, shell):
+    """THE ORACLE, not due (2). Mutation: re-assert on every poll, and this
+    fails."""
+    layout = _du_standing(tmp_path, shell)
+    _make_recent(layout)
+    stamp_before = _memory_asserted(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [], drift
+    assert "not linked now" not in out, out
+    assert _memory_asserted(layout) == stamp_before, "a poll that is not due carries the clock"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_table_name_never_linked_is_not_drift(tmp_path, shell):
+    """(3) du was never on this node: not linked by the install, not linked
+    now. The table wraps a dozen names a node may never have, so "the table
+    minus what is linked" is a constant, not drift. Mutation: compute
+    standing as the table minus the linked set, and this fails."""
+    layout = _drift_install(tmp_path, shell, tools=TWO_TOOLS)
+    assert _memory_names(layout) == ["find", "grep"]
+    _make_due(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [], drift
+    assert "not linked now" not in out, out
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_an_install_without_a_name_answers_its_drift(tmp_path, shell):
+    """(4) The memory lists du; an install runs with du absent; a due relink
+    after it reports nothing, and the memory is the install's own. A tool
+    missing at the install is not drift. Mutation: carry the memory forward
+    across --system, and this fails."""
+    layout = _du_standing(tmp_path, shell)
+    layout = _drift_install(tmp_path, shell, tools=TWO_TOOLS, layout=layout)
+    assert _memory(layout)[2:] == ["seeded system", "find", "grep"], _memory(layout)
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [], drift
+    assert _memory(layout)[2:] == ["seeded system", "find", "grep"]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_new_boot_keeps_the_memory_and_makes_the_reassertion_due(tmp_path, shell):
+    """(5) A memory written under another boot, du standing, its clock
+    recent: re-asserted, because a volatile journal forgot the earlier line,
+    and du is still remembered, because a tool missing before a reboot is
+    missing after it. Mutations: reset the memory at a new boot, or ignore
+    the boot line, and this fails."""
+    layout = _du_standing(tmp_path, shell)
+    _make_recent(layout)
+    _set_memory_line(layout, 0, "boot an-earlier-boot")
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", True)], drift
+    assert "du" in _memory_names(layout), _memory(layout)
+    assert _memory(layout)[0].split() == ["boot", _boot_id()]
+    assert _memory(layout)[2] == "seeded system"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_memory_is_a_high_water_mark(tmp_path, shell):
+    """(6) Installed without du; du appears and a relink links it; du
+    vanishes. The vanishing poll writes the change record, the next
+    not-due poll nothing, the next due poll the re-assertion. Mutations:
+    keep the memory as the last --system's set only, or as the last
+    relink's set, and the re-assertion is missing."""
+    layout = _drift_install(tmp_path, shell, tools=TWO_TOOLS)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=ALL_TOOLS)
+    assert drift == [], drift
+    assert _memory_names(layout) == ["find", "grep", "du"], _memory(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", None)], "the vanishing poll: %s" % drift
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [], "a poll that is not due: %s" % drift
+    _make_due(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", True)], "the due poll: %s" % drift
+    assert out.count("not linked now: du\n") == 1, out
+    assert _memory(layout)[2] == "seeded system"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_several_standing_names_are_one_record_counted(tmp_path, shell):
+    """(7) Four names standing: one record, `unwrapped-4`, and the names on
+    stdout. The due poll unlinks nothing, so a count taken from link_farm's
+    own drops would be zero. Mutations: one record per name, or N taken
+    from _dropped, and this fails."""
+    tools = ("find", "grep", "du", "rg", "fd")
+    layout = _drift_install(tmp_path, shell, tools=tools)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=("find",))
+    assert drift == [("unwrapped-4", None)], drift
+    _make_due(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=("find",))
+    assert drift == [("unwrapped-4", True)], drift
+    line = next(l for l in out.splitlines() if "not linked now:" in l)
+    assert sorted(line.split(":", 2)[2].split()) == ["du", "fd", "grep", "rg"], line
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_name_unlinked_on_a_due_poll_gets_the_change_record_only(tmp_path, shell):
+    """The poll the cadence falls due on is also the poll grep goes: grep
+    gets the change record, du (already standing) the re-assertion, and
+    neither is said twice -- ADR-0030's rule for a mount, kept for a name."""
+    layout = _du_standing(tmp_path, shell)
+    _make_due(layout)
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=("find",))
+    assert sorted(drift, key=str) == sorted(
+        [("unwrapped-1", None), ("unwrapped-1", True)], key=str), drift
+    assert "not linked now: du\n" in out, out
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=("find",))
+    assert drift == [("unwrapped-2", True)], drift
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_swept_link_is_a_change_and_never_standing(tmp_path, shell):
+    """(8) A planted symlink no table name claims is swept: it is in the
+    one-off change record, and never in a re-assertion, on the due poll it
+    goes or after. Mutation: count SWEPT_N as standing, and this fails."""
+    layout = _drift_install(tmp_path, shell)
+    os.symlink("/nonexistent/guard.sh", str(layout.bin / "updatedb"))
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [("unwrapped-1", None)], drift
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [], drift
+    assert "updatedb" not in _memory(layout)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_missing_memory_is_unknown_not_empty(tmp_path, shell):
+    """(9) No memory at the relink: one unmarked `coverage_change unknown`,
+    the memory reseeded from this poll as `seeded relink`, silence before
+    the cadence, and `unknown` marked on the next due poll. Mutations: read
+    a missing memory as an empty one, or never re-assert `unknown`, and
+    this fails."""
+    layout = _drift_install(tmp_path, shell)
+    (layout.spool / LINKED).unlink()
+    out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", None), ("unknown", None)], drift
+    assert "drift before this poll is unknown" in out, out
+    assert _memory(layout)[2:] == ["seeded relink", "find", "grep"], _memory(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [], drift
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unknown", True)], drift
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_only_an_install_clears_unknown(tmp_path, shell):
+    """(10) A `seeded relink` memory keeps its origin across relinks, while
+    its names still grow; the next install writes `seeded system` and the
+    unknown stops. Mutation: let a relink rewrite the origin, and this
+    fails."""
+    layout = _drift_install(tmp_path, shell, tools=TWO_TOOLS)
+    (layout.spool / LINKED).unlink()
+    _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    _drift_relink(tmp_path, layout, shell, tools=ALL_TOOLS)
+    assert _memory(layout)[2:] == ["seeded relink", "find", "grep", "du"], _memory(layout)
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=ALL_TOOLS)
+    assert drift == [("unknown", True)], drift
+    assert _memory(layout)[2] == "seeded relink"
+    layout = _drift_install(tmp_path, shell, layout=layout)
+    assert _memory(layout)[2] == "seeded system"
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [], drift
+
+
+def _corrupt(layout, kind, sentinel):
+    path = layout.spool / LINKED
+    lines = _memory(layout)
+    path.unlink()
+    if kind == "bad-line-1":
+        lines[0] = "booted " + _boot_id()
+    elif kind == "bad-line-3":
+        lines[2] = "seeded sometime"
+    elif kind == "non-table-name":
+        lines.append("updatedb")
+    elif kind == "walk-job":
+        lines.append("walk-job")
+    elif kind == "directory":
+        path.mkdir()
+        return
+    elif kind == "symlink":
+        os.symlink(str(sentinel), str(path))
+        return
+    elif kind == "symlink-to-memory":
+        # A link to a WELL-FORMED memory: only the `[ -L ]` check can refuse
+        # it. The sentinel above fails line 1 on its own, so it proves the
+        # link is not followed for writing but not that it is not read.
+        sentinel.write_text("\n".join(lines) + "\n")
+        os.symlink(str(sentinel), str(path))
+        return
+    elif kind == "bad-boot-charset":
+        lines[0] = "boot ../" + _boot_id()
+    elif kind == "short":
+        lines = lines[:2]
+    elif kind == "unreadable":
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(0)
+        return
+    path.write_text("\n".join(lines) + "\n")
+
+
+CORRUPTIONS = ["bad-line-1", "bad-line-3", "non-table-name", "walk-job",
+               "directory", "symlink", "symlink-to-memory",
+               "bad-boot-charset", "short", "unreadable"]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("kind", CORRUPTIONS)
+def test_a_damaged_memory_is_unknown_and_never_followed(tmp_path, shell, kind):
+    """(11) Garbage is never read as health: each damaged memory is reported
+    `unknown`, unmarked, and reseeded as `seeded relink`; the next due poll
+    marks it. A link at the name is replaced, never followed: the sentinel
+    keeps its bytes and mode. A directory at the name cannot be replaced by
+    a rename, so it is unknown on every poll -- repetition, never silence.
+    Mutations: read garbage as an empty memory, or open the name through a
+    link, and this fails. Each kind reaches a different check: a link to a
+    well-formed memory only `[ -L ]`, an unreadable file only `[ ! -r ]` (or
+    the read's own failure), a file cut short only the three-line minimum,
+    and a boot id outside its character set only that set."""
+    if kind == "unreadable" and os.geteuid() == 0:
+        pytest.skip("root reads a mode-0 file; CI runs unprivileged")
+    layout = _drift_install(tmp_path, shell)
+    sentinel = _sentinel(tmp_path)
+    _corrupt(layout, kind, sentinel)
+    # After the corruption, before any relink: what the relink must not move.
+    before = _sentinel_state(sentinel)
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [("unknown", None)], drift
+    assert _sentinel_state(sentinel) == before
+    if kind == "directory":
+        assert (layout.spool / LINKED).is_dir()
+        _out, drift = _drift_relink(tmp_path, layout, shell)
+        assert drift == [("unknown", None)], drift
+        assert not (layout.spool / (LINKED + ".new")).exists()
+        return
+    assert not (layout.spool / LINKED).is_symlink()
+    assert _memory(layout)[2:] == ["seeded relink", "find", "grep", "du"], _memory(layout)
+    _make_due(layout)
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [("unknown", True)], drift
+    assert _sentinel_state(sentinel) == before
+
+
+def _uptime_unreadable(layout):
+    """The deployed copy with its uptime source pointed at nothing: the one
+    way to make /proc/uptime unreadable without root."""
+    text = layout.script.read_text()
+    assert "/proc/uptime" in text
+    layout.script.write_text(text.replace("/proc/uptime", "/nonexistent/uptime"))
+
+
+def _clock_due(tmp_path, shell, asserted, now, interval):
+    """Run install.sh's sg_clock_due alone with a chosen NOW, which a relink
+    cannot be given: it reads /proc/uptime, and that moves between a test's
+    stamp and the relink's read. True when it says due."""
+    text = stamped_install(tmp_path, dest=tmp_path / "clock-copy").script.read_text()
+    body = re.search(r"^sg_clock_due\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+    driver = tmp_path / "clock.sh"
+    driver.write_text("set -eu\nSG_REASSERT_INTERVAL_S=%d\n%s"
+                      'if sg_clock_due "$1" "$2"; then echo due; else echo quiet; fi\n'
+                      % (interval, body))
+    result = subprocess.run([shutil.which(shell), str(driver), str(asserted), str(now)],
+                            capture_output=True, text=True, timeout=30, env={"PATH": ""})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout in ("due\n", "quiet\n"), result.stdout
+    return result.stdout == "due\n"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("elapsed,due", [
+    (0, False), (REASSERT - 1, False), (REASSERT, True), (REASSERT + 1, True),
+], ids=["same-second", "one-short", "exactly-the-interval", "one-past"])
+def test_the_cadence_is_due_once_the_interval_has_elapsed(tmp_path, shell, elapsed, due):
+    """The boundary of ADR-0030's clock, shared by both memories: a condition
+    asserted exactly one interval ago is due on this poll, not the next.
+    Mutation: `-lt` to `-le` in sg_clock_due(), and exactly-the-interval
+    fails."""
+    asserted = 1000
+    assert _clock_due(tmp_path, shell, asserted, asserted + elapsed, REASSERT) is due
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("line", [
+    "asserted ", "asserted", "asserted notanumber", "asserted 0089",
+    "asserted " + "9" * 19, "FUTURE", "UNREADABLE-UPTIME",
+], ids=["empty", "no-value", "not-a-number", "leading-zero", "19-digits",
+        "future", "unreadable-uptime"])
+def test_a_clock_that_cannot_be_read_is_due(tmp_path, shell, line):
+    """(12) Every malformed clock, and an unreadable uptime, re-asserts:
+    the same sg_clock_due() as ADR-0030's memory, so the same cases. A
+    readable clock is then stamped and the next poll is quiet; with no
+    uptime there is never a clock, so every poll re-asserts. Mutation: read
+    a parse failure as recent, and this fails."""
+    layout = _du_standing(tmp_path, shell)
+    if line == "FUTURE":
+        line = "asserted %d" % (_uptime() + 10 * REASSERT)
+    if line == "UNREADABLE-UPTIME":
+        _make_recent(layout)
+        _uptime_unreadable(layout)
+    else:
+        _set_memory_line(layout, 1, line)
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    assert drift == [("unwrapped-1", True)], drift
+    _out, drift = _drift_relink(tmp_path, layout, shell, tools=TWO_TOOLS)
+    if line == "UNREADABLE-UPTIME":
+        assert _memory(layout)[1] == "asserted ", _memory(layout)
+        assert drift == [("unwrapped-1", True)], drift
+    else:
+        assert drift == [], drift
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_nothing_standing_on_a_due_poll_says_nothing_and_moves_the_clock(tmp_path, shell):
+    """(13) No heartbeat (ADR-0008): a due poll with nothing standing writes
+    no record, and the clock still advances. Mutations: report an empty set,
+    or carry the clock forward on a due poll, and this fails."""
+    layout = _drift_install(tmp_path, shell)
+    _make_due(layout)
+    before = _uptime()
+    _out, drift = _drift_relink(tmp_path, layout, shell)
+    assert drift == [], drift
+    assert _memory_asserted(layout) >= before
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_memory_is_a_new_0640_inode_never_written_through_a_link(tmp_path, shell):
+    """(14) Mode 0640 under a 077 umask, a new inode on every write, no
+    `.new` left behind, and a link planted at `.new` replaced rather than
+    followed. Mutations: write the memory in place, or chmod the final
+    name, and this fails."""
+    sentinel = _sentinel(tmp_path)
+    before_sentinel = _sentinel_state(sentinel)
+    before = os.umask(0o077)
+    try:
+        layout = _drift_install(tmp_path, shell)
+        path = layout.spool / LINKED
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
+        inodes = [path.stat().st_ino]
+        os.symlink(str(sentinel), str(layout.spool / (LINKED + ".new")))
+        for _ in range(2):
+            _drift_relink(tmp_path, layout, shell)
+            assert stat.S_IMODE(path.stat().st_mode) == 0o640
+            assert not path.is_symlink()
+            inodes.append(path.stat().st_ino)
+            assert not os.path.lexists(str(layout.spool / (LINKED + ".new")))
+    finally:
+        os.umask(before)
+    assert len(set(inodes)) == 3, inodes
+    assert _sentinel_state(sentinel) == before_sentinel
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("spool", ["absent", "foreign", "unmarked"])
+def test_without_a_pinned_spool_there_is_no_drift_and_no_memory(tmp_path, shell, spool):
+    """(15) No pinned spool -- none at all, one owned by someone else, or
+    one without the marker (in_spool returns 3) -- reads nothing, writes
+    nothing and reports no drift, while link_farm's own change record still
+    fires. Mutation: fall back to the table minus the linked set, and this
+    fails."""
+    if spool == "unmarked":
+        layout = _drift_install(tmp_path, shell)
+        (layout.spool / H.SPOOL_MARKER).unlink()
+        _make_due(layout)
+        memory = (layout.spool / LINKED).read_bytes()
+        result, records = relink_with_a_recording_logger(
+            tmp_path, layout, tools=TWO_TOOLS, fake_uid=0, script=layout.script,
+            shell=_sh(shell))
+        assert result.returncode == 0, result.stderr
+        assert _drift(records) == [("unwrapped-1", None)], records
+        assert (layout.spool / LINKED).read_bytes() == memory
+        return
+    layout = Layout(tmp_path)
+    layout.bin.mkdir(parents=True)
+    os.symlink("/nonexistent/guard.sh", str(layout.bin / "du"))
+    stat_body = None
+    if spool == "foreign":
+        H.stage_spool(layout)
+        stat_body = H.stat_stub(spool_owner=os.getuid() + 1)
+    result, records = relink_with_a_recording_logger(
+        tmp_path, layout, tools=TWO_TOOLS, stat_body=stat_body, shell=_sh(shell))
+    assert result.returncode == 0, result.stderr
+    assert _drift(records) == [("unwrapped-1", None)], records
+    assert [str(p) for p in tmp_path.rglob(LINKED + "*")] == []
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_sg_report_takes_a_marker_in_its_short_form(tmp_path, shell):
+    """(16) `sg_report ACTION STATE reasserted` marks the record at the same
+    priority; any other third argument is a caller bug; the two-argument
+    form is unchanged. Mutation: ignore the third argument, as before, and
+    the `bogus` case writes an unmarked change record."""
+    _need(shell)
+    prio, record = _drive_sg_report(tmp_path / "marked", "coverage_change",
+                                    "unwrapped-2", "reasserted", shell=shell)
+    assert prio == "user.warning"
+    assert record == {"layer": "shim", "action": "coverage_change",
+                      "state": "unwrapped-2", "reasserted": True}
+    prio, record = _drive_sg_report(tmp_path / "plain", "coverage_change",
+                                    "unwrapped-2", shell=shell)
+    assert prio == "user.warning"
+    assert record == {"layer": "shim", "action": "coverage_change",
+                      "state": "unwrapped-2"}
+    for third in ("bogus", "", "true", "Reasserted"):
+        _prio, record = _drive_sg_report(tmp_path / ("bad-" + (third or "empty")),
+                                         "coverage_change", "unwrapped-2", third,
+                                         shell=shell)
+        assert record == {"layer": "shim", "action": "caller-bug",
+                          "state": "caller-bug"}, (third, record)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("marker", [(), ("reasserted",)])
+def test_coverage_change_unknown_is_logged_at_err(tmp_path, shell, marker):
+    """Issue #159, ADR-0033: `unknown` says the relink cannot tell whether
+    coverage drifted, and ranks above the warning real drift carries -- the
+    change record and every re-assertion of it. Mutation: drop the
+    `coverage_change:unknown` branch, and both cases read user.warning."""
+    _need(shell)
+    prio, record = _drive_sg_report(tmp_path, "coverage_change", "unknown",
+                                    *marker, shell=shell)
+    assert prio == "user.err", (marker, prio)
+    want = {"layer": "shim", "action": "coverage_change", "state": "unknown"}
+    if marker:
+        want["reasserted"] = True
+    assert record == want, record
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("marker", [(), ("reasserted",)])
+def test_coverage_change_unwrapped_stays_at_warning(tmp_path, shell, marker):
+    """Real drift keeps its priority (ADR-0031, as narrowed by ADR-0033)."""
+    _need(shell)
+    prio, record = _drive_sg_report(tmp_path, "coverage_change", "unwrapped-1",
+                                    *marker, shell=shell)
+    assert prio == "user.warning", (marker, prio)
+    assert record["state"] == "unwrapped-1", record
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_caller_bug_with_unknown_is_not_raised_to_err(tmp_path, shell):
+    """A bad third argument makes a caller-bug record, and that keeps the
+    warning: the raise is for the fact `unknown` reports, not for a call
+    that only names it."""
+    _need(shell)
+    prio, record = _drive_sg_report(tmp_path, "coverage_change", "unknown",
+                                    "bogus", shell=shell)
+    assert record == {"layer": "shim", "action": "caller-bug",
+                      "state": "caller-bug"}, record
+    assert prio == "user.warning", prio
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("missing", ["link", "target"])
+def test_walk_job_is_never_drift(tmp_path, shell, missing):
+    """(17) walk-job is linked unconditionally and is not a table name, so
+    it is never in the memory and never standing, whether its link or its
+    target has gone. The target case runs the unprivileged relink, which
+    does not check the payload's ownership and so reaches link_farm.
+    Mutation: put walk-job in the memory, and this fails."""
+    layout = _drift_install(tmp_path, shell)
+    assert "walk-job" not in _memory(layout)
+    _make_due(layout)
+    if missing == "link":
+        (layout.bin / "walk-job").unlink()
+        _out, drift = _drift_relink(tmp_path, layout, shell)
+    else:
+        (layout.prefix / "walk-job").unlink()
+        result, records = relink_with_a_recording_logger(
+            tmp_path, layout, tools=ALL_TOOLS, script=layout.script, shell=_sh(shell))
+        assert result.returncode == 0, result.stdout + result.stderr
+        drift = _drift(records)
+    assert drift == [], drift
+    assert "walk-job" not in _memory(layout)
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("planted", ["files", "links"])
+def test_the_uninstall_removes_the_linked_memory_never_through_a_link(
+        tmp_path, shell, planted):
+    """(18) Both names go, from the pinned spool; a link at either is
+    removed and its target left alone. Mutations: leave the memory behind,
+    or remove through the link, and this fails."""
+    layout = _drift_install(tmp_path, shell)
+    sentinel = _sentinel(tmp_path)
+    before = _sentinel_state(sentinel)
+    for name in (LINKED, LINKED + ".new"):
+        path = layout.spool / name
+        if path.exists():
+            path.unlink()
+        if planted == "links":
+            os.symlink(str(sentinel), str(path))
+        else:
+            path.write_text("boot x\n")
+    result, layout = run_install(tmp_path, ["--uninstall"], fake_uid=0, layout=layout,
+                                 script=layout.script, shell=_sh(shell))
+    assert result.returncode == 0, result.stdout + result.stderr
+    for name in (LINKED, LINKED + ".new"):
+        assert not os.path.lexists(str(layout.spool / name)), name
+    assert _sentinel_state(sentinel) == before
+    assert layout.spool.is_dir() and (layout.spool / H.SPOOL_MARKER).exists()
+
+
+# --------------------------------------------------------------------------
+# install.sh --system says when the timer is not armed (issue #105)
+# --------------------------------------------------------------------------
+
+NOT_ARMED = "so Layer 2 (the reaper) and the reconcile are not armed"
+CANNOT_READ = "cannot read the state of walk-blocker.timer"
+
+
+def _timer_lines(stdout):
+    return [line for line in stdout.splitlines()
+            if "walk-blocker.timer" in line and "Layer 2" in line]
+
+
+def _system_install(tmp_path, shell, absent=False, tools=("find", "grep", "du"),
+                    **state):
+    _need(shell)
+    layout = Layout(tmp_path)
+    layout.bashrc.write_text(STOCK_BASHRC)
+    H.set_systemctl_state(layout.toolbin, **state)
+    result, layout = run_install(tmp_path, ["--system"], fake_uid=0, layout=layout,
+                                 shell=shutil.which(shell), systemctl_absent=absent,
+                                 tools=tools)
+    calls = [] if absent else [a for a, _b in H.systemctl_calls(layout.toolbin)]
+    assert set(calls) <= TIMER_READS, "the install changed the units: %r" % calls
+    return result
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("state, said", [
+    ({"TIMER_FILE": "disabled", "TIMER_ACTIVE": "inactive"}, "inactive and disabled"),
+    ({"TIMER_FILE": "enabled", "TIMER_ACTIVE": "inactive"}, "inactive and enabled"),
+    ({"TIMER_FILE": "disabled", "TIMER_ACTIVE": "active"}, "active and disabled"),
+    ({"TIMER_FILE": "absent", "TIMER_ACTIVE": "inactive"},
+     "inactive and without a unit file"),
+], ids=["after-uninstall", "stopped", "not-at-boot", "no-unit"])
+def test_a_system_install_says_when_the_timer_is_not_armed(tmp_path, shell, state, said):
+    """After `install.sh --uninstall` the timer is disabled, and a by-hand
+    `--system` restored Layer 1 and said nothing about Layer 2. One stdout
+    line names the state as read and the one restore; it never advises
+    `systemctl enable`. Mutation: make timer_notice return 0 at once, and
+    every case here fails."""
+    result = _system_install(tmp_path, shell, **state)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = _timer_lines(result.stdout)
+    assert len(lines) == 1, result.stdout
+    assert "walk-blocker.timer is %s, %s" % (said, NOT_ARMED) in lines[0], lines
+    assert "`python3 deploy.py --system`" in lines[0], lines
+    assert "systemctl enable" not in result.stdout + result.stderr
+    assert "system-wide install complete" in result.stdout
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_an_armed_timer_gets_no_line(tmp_path, shell):
+    """Silence is earned by the one healthy reading, active and enabled."""
+    result = _system_install(tmp_path, shell, TIMER_FILE="enabled",
+                             TIMER_ACTIVE="active")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _timer_lines(result.stdout) == [], result.stdout
+    assert "system-wide install complete" in result.stdout
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("quirk, absent", [
+    ("", True), ("show-fails", False), ("bus-error", False),
+], ids=["no-systemctl", "show-fails", "bus-error"])
+def test_an_unreadable_timer_state_is_said_not_silenced(tmp_path, shell, quirk, absent):
+    """Absent systemctl, a failing `show` and a bus that prints nothing are
+    not a healthy reading. The timer is set armed underneath, so only the
+    read failing can produce the line."""
+    result = _system_install(tmp_path, shell, absent=absent, QUIRK=quirk,
+                             TIMER_FILE="enabled", TIMER_ACTIVE="active")
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = _timer_lines(result.stdout)
+    assert len(lines) == 1 and CANNOT_READ in lines[0], result.stdout
+    assert "`python3 deploy.py --system`" in lines[0], lines
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_hook_failure_exit_also_says_the_timer_is_not_armed(tmp_path, shell):
+    """`verify_hooks || exit 4` is the other way out of a writing install,
+    and Layer 2's state is as much worth saying there. Exit 4 unchanged."""
+    result = _system_install(tmp_path, shell, tools=(), TIMER_FILE="disabled",
+                             TIMER_ACTIVE="inactive")
+    assert result.returncode == 4, result.stdout + result.stderr
+    lines = _timer_lines(result.stdout)
+    assert len(lines) == 1, result.stdout
+    assert "inactive and disabled, " + NOT_ARMED in lines[0], lines
+    assert "system-wide install complete" not in result.stdout
+
+
+def test_the_dry_run_says_the_install_does_not_enable_the_timer(tmp_path):
+    result, _layout = run_install(tmp_path, ["--system", "--dry-run"])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("#   - NOT enable walk-blocker.timer: install.sh --system leaves it "
+            "as it found it") in result.stdout, result.stdout

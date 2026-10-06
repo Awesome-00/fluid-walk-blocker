@@ -499,7 +499,8 @@ def test_deploy_system_refuses_without_root(tmp_path, monkeypatch):
     assert not os.path.exists(args.unit_dir)
 
 
-def test_deploy_system_uninstall_requires_root_only(tmp_path, monkeypatch):
+def test_deploy_system_uninstall_requires_root_only(tmp_path, monkeypatch,
+                                                    capsys):
     """Reversing a control is the safer direction. The uninstall that WRITES
     needs proof of root, which since ADR-0021 is the whole of the install's
     gate too."""
@@ -515,6 +516,10 @@ def test_deploy_system_uninstall_requires_root_only(tmp_path, monkeypatch):
     assert deploy.system_uninstall(args) == 0
     assert any(c[:3] == ["systemctl", "disable", "--now"] for c in calls)
     assert any("--uninstall" in c for c in calls)
+    # The writing run still says it removed; only the dry run may not
+    # (issue #109).
+    out = capsys.readouterr().out
+    assert "\nremoved. " in out and "dry run" not in out, out
 
 
 def test_the_uninstall_dry_run_needs_no_root_and_writes_nothing(
@@ -537,7 +542,11 @@ def test_the_uninstall_dry_run_needs_no_root_and_writes_nothing(
     assert deploy.system_uninstall(args) == 0
     assert dry and all(dry), dry
     assert sorted(os.walk(str(tmp_path))) == before, "a dry run wrote"
-    assert "NOT CHECKED" not in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "NOT CHECKED" not in out
+    # Issue #109: it used to end "removed.", over a removal that never ran.
+    assert "removed" not in out, out
+    assert "dry run: nothing was changed" in out, out
 
     assert deploy.system_uninstall(_args(tmp_path)) == 3
 
@@ -1209,6 +1218,67 @@ def test_a_hook_proof_failure_still_arms_the_reaper(
     # "installed" alone would say otherwise.
     assert "best-effort hook" in err and "not written" in err, err
     assert "None" not in err.splitlines(), err
+
+
+def _failing_systemctl(calls, failing, installer_rc):
+    """recording_run, except that `failing` exits 5 and, like the real run(),
+    raises SystemExit with that status under check=True."""
+    inner = recording_run(calls, installer_rc=installer_rc)
+
+    def fake_run(cmd, check=True, capture=True, dry_run=False, env=None):
+        result = inner(cmd, check=check, capture=capture, dry_run=dry_run,
+                       env=env)
+        if cmd[:len(failing)] == failing:
+            sys.stderr.write("failed: %s\n" % " ".join(cmd))
+            if check:
+                raise SystemExit(5)
+            return subprocess.CompletedProcess(cmd, 5, "", "")
+        return result
+    return fake_run
+
+
+@pytest.mark.parametrize("failing", [
+    ["systemctl", "daemon-reload"],
+    ["systemctl", "enable", "--now"],
+])
+def test_a_systemctl_failure_after_a_hook_proof_failure_says_both(
+        tmp_path, monkeypatch, capsys, failing):
+    """Issue #145, ruled: the command's own status wins over 4, because 4
+    promises Layer 2 is running and a failed daemon-reload or enable means
+    it is not known to be. The hook failure is still reported by deploy.py,
+    not left to install.sh's stderr. Mutations: drop the notice, and "NOT
+    proven" is missing; return 4 instead of re-raising, and no SystemExit."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    calls = []
+    monkeypatch.setattr(deploy, "run",
+                        _failing_systemctl(calls, failing, installer_rc=4))
+    with contextlib.redirect_stdout(io.StringIO()), \
+            pytest.raises(SystemExit) as exc:
+        deploy.system_execute(_args(tmp_path))
+    assert exc.value.code == 5
+    err = capsys.readouterr().err
+    assert "Layer 1 NOT proven AND Layer 2 NOT armed" in err, err
+    assert "Layer 2 is running" not in err, err
+    # The notice follows run()'s own report of the command, not the reverse.
+    assert err.index("failed: " + " ".join(failing)) \
+        < err.index("NOT proven"), err
+
+
+def test_a_systemctl_failure_with_the_hooks_proven_names_no_hook(
+        tmp_path, monkeypatch, capsys):
+    """The other half of #145: only an unproven hook adds the notice. With the
+    hooks proven, a failed enable exits with its own status and says nothing
+    about Layer 1."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    pass_prefix_checks(monkeypatch)
+    monkeypatch.setattr(deploy, "run", _failing_systemctl(
+        [], ["systemctl", "enable", "--now"], installer_rc=0))
+    with contextlib.redirect_stdout(io.StringIO()), \
+            pytest.raises(SystemExit) as exc:
+        deploy.system_execute(_args(tmp_path))
+    assert exc.value.code == 5
+    assert "NOT proven" not in capsys.readouterr().err
 
 
 def test_a_journal_abort_does_not_hide_the_hook_notice(
@@ -2610,6 +2680,36 @@ def test_uninstall_refuses_rather_than_falling_back_to_the_payload_directory(
     assert os.path.join(args.prefix, "bin") in err
 
 
+@pytest.mark.parametrize("fish, zsh, bash", [
+    (True, True, True),
+    (False, True, True),
+    (False, False, False),
+])
+def test_a_refused_uninstall_helper_names_only_the_hooks_this_site_has(
+        tmp_path, monkeypatch, capsys, fish, zsh, bash):
+    """Issue #142: the hand route said "remove the fish drop-in outright"
+    whatever the hook table enabled, and with every hook off it said that
+    beside "the hook files are none on this site". The fish step appears
+    only with the fish hook, the marker step only with a shared hook file,
+    and a site with neither says it has no hook file to clean."""
+    monkeypatch.setattr(deploy, "_is_root", lambda: True)
+    monkeypatch.setattr(deploy, "HOOK_ENABLED_FISH", fish)
+    monkeypatch.setattr(deploy, "HOOK_ENABLED_ZSH", zsh)
+    monkeypatch.setattr(deploy, "HOOK_ENABLED_BASH", bash)
+    args = _args(tmp_path)
+    pass_uninstall_checks(monkeypatch, args.prefix)
+    os.unlink(os.path.join(args.prefix, "shim", "install.sh"))
+    monkeypatch.setattr(deploy, "run", recording_run([]))
+
+    assert deploy.system_uninstall(args) == 5
+    err = capsys.readouterr().err
+    assert ("fish drop-in" in err) == fish, err
+    assert (args.fish_conf_file in err) == fish, err
+    assert ("walk-blocker markers" in err) == (zsh or bash), err
+    assert ("enables none" in err) == (not (fish or zsh or bash)), err
+    assert "none on this site" not in err, err
+
+
 def test_a_refused_uninstall_helper_leaves_the_units_as_they_were(
         tmp_path, monkeypatch, capsys):
     """Issue #110. The helper was checked after `systemctl disable --now`
@@ -2646,6 +2746,8 @@ def test_a_refused_uninstall_helper_names_the_spool_memory(
     assert deploy.system_uninstall(args) == 5
     err = capsys.readouterr().err
     assert os.path.join(args.spool_dir, deploy.UNCOVERED_NAME) in err, err
+    # And the linked-set memory beside it (ADR-0031).
+    assert os.path.join(args.spool_dir, deploy.LINKED_NAME) in err, err
 
 
 def test_deploy_and_install_name_the_same_spool_memory():
@@ -2653,6 +2755,17 @@ def test_deploy_and_install_name_the_same_spool_memory():
     with open(os.path.join(ROOT, "node", "shim", "install.sh")) as fh:
         text = fh.read()
     assert "\nUNCOVERED_NAME=%s\n" % deploy.UNCOVERED_NAME in text
+
+
+def test_deploy_and_install_name_the_same_linked_memory():
+    """ADR-0031's memory: one literal in install.sh, one in deploy.py, and
+    both it and its write-and-rename are installer-owned spool names, so
+    the deploy repairs and checks them like the rest."""
+    with open(os.path.join(ROOT, "node", "shim", "install.sh")) as fh:
+        text = fh.read()
+    assert "\nLINKED_NAME=%s\n" % deploy.LINKED_NAME in text
+    assert deploy.LINKED_NAME in deploy.INSTALLER_OWNED_SPOOL_NAMES
+    assert deploy.LINKED_NAME + ".new" in deploy.INSTALLER_OWNED_SPOOL_NAMES
 
 
 def test_a_refused_uninstall_helper_gives_the_journal_revoke_commands(
